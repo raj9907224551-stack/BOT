@@ -42,3 +42,12 @@ RG Admin Panel – requested fixes
 - All Button Emoji keeps the requested two-column catalog layout.
 - Existing backup entries in the Backup Center now have a clearly visible Download Backup button directly underneath each listed archive.
 - No existing Product, Plan, User, Payment, API, or User Panel feature was intentionally removed.
+
+
+8. Bulk User & Reseller Reset / Restore
+- Added Reset All Users & Resellers and Restore User Data controls under Users & Resellers.
+- Bulk reset snapshots the database before changes, clears user profiles, balances, verification/referral state, user order/payment records, reseller API credentials and per-user custom prices.
+- Products, plans, stock/manual keys, country/product catalogs, server/API configuration and bot settings are preserved.
+- /start on reset accounts re-enters the existing phone-contact validation flow.
+- Restore brings back the saved user/reseller data and user-linked records without overwriting current products or bot settings.
+- Confirmation screens protect against accidental bulk reset/restore.

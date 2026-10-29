@@ -20,3 +20,10 @@ Latest Admin UI hardening:
 - The four User Panel Back buttons remain editable in Button Colors and All Button Emoji.
 - All Button Emoji uses the requested two-column layout.
 - Backup Center lists now show a dedicated Download Backup button beneath every archive.
+
+
+Bulk User Reset / Restore addition:
+- Admin > Users & Resellers now has Reset All Users & Resellers and Restore User Data.
+- The reset is snapshot-backed and user-scoped; product/plan/catalog/server settings are retained.
+- Reset users must share their phone contact again after /start.
+- Restore rehydrates the saved user/reseller records and user-linked history while retaining current products and settings.
