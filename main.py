@@ -1052,7 +1052,6 @@ def _render_admin_parent_screen(chat_id, user_id):
 
 # Active Order Tracking Dictionary for In-Bot Verification
 active_orders = {}
-_zyvo_order_references = {}
 
 # QR cleanup is isolated to the currently active Reseller Discount QR message.
 # Other screens such as Orders, Top Up, My Account and Referral never use this state.
@@ -1230,9 +1229,9 @@ def init_db():
     cursor.execute("CREATE TABLE IF NOT EXISTS payment_gateways (gateway TEXT PRIMARY KEY, upi_id TEXT NOT NULL DEFAULT '', merchant_id TEXT NOT NULL DEFAULT '', merchant_key TEXT NOT NULL DEFAULT '', connected INTEGER NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '')")
     cursor.execute('INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,1,?)',('fam',RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY,datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     cursor.execute("UPDATE payment_gateways SET upi_id=?,merchant_id=?,merchant_key=? WHERE gateway='fam' AND (upi_id='' OR merchant_id='')",(RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY))
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','zyvo')")
+    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','')")
+    cursor.execute("UPDATE settings SET value='' WHERE key='active_payment_gateway' AND value='zyvo'")
     cursor.execute("INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)",('paytm','','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    cursor.execute("INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)",('zyvo','','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_pos_id','')")
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_client_id',?)",(PAYTM_DEFAULT_CLIENT_ID,))
     # Admin-controlled runtime settings. Defaults preserve the bot's current behavior.
@@ -1905,119 +1904,98 @@ def _set_active_payment_gateway(gateway):
     gateway=str(gateway or '').lower().strip()
     if not gateway:
         set_setting('active_payment_gateway',''); return True
-    if gateway != 'zyvo': return False
+    if gateway not in {'fam','paytm'}: return False
     row=_gateway_row(gateway)
-    if not row or not get_zyvo_config()['api_key'] or not int(row[4] or 0): return False
+    if not row or not row[1] or not row[2] or not int(row[4] or 0): return False
     set_setting('active_payment_gateway',gateway); return True
 
 def _gateway_status_line(gateway):
-    gateway = str(gateway).lower()
-    row=_gateway_row(gateway)
-    if gateway == 'zyvo':
-        configured = bool(get_zyvo_config()['api_key'])
-    else:
-        configured = bool(row and row[1] and row[2])
-    if not row or not configured:
+    row=_gateway_row(str(gateway).lower())
+    if not row or not (row[1] and row[2]):
         return 'NOT CONFIGURED'
     return 'CONNECTED' if int(row[4] or 0) else 'NOT CONNECTED'
 
 
 
-
-
-
-
-
-
-
-def _fam_gateway_base_candidates():
-    """Return compatible FamGateway base URLs without duplicating /api."""
-    raw = str(BASE_GATEWAY_URL or '').strip().rstrip('/')
-    if not raw:
-        raw = 'https://famgateway.in/api'
-    candidates = [raw]
+def _fam_base_url():
+    raw = str(BASE_GATEWAY_URL or '').strip().rstrip('/') or 'https://fampaygateway.site'
     if raw.lower().endswith('/api'):
-        candidates.append(raw[:-4].rstrip('/'))
-    elif raw.lower().endswith('/api/'):
-        candidates.append(raw[:-5].rstrip('/'))
-    return list(dict.fromkeys(candidates))
+        raw = raw[:-4].rstrip('/')
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError('Invalid FamPay gateway URL.')
+    return raw
 
+def _fam_credentials():
+    row = _gateway_row('fam')
+    key = str((row[2] if row and row[2] else (row[3] if row and row[3] else FAM_API_KEY)) or '').strip()
+    upi = str((row[1] if row and row[1] else RECEIVER_UPI) or '').strip()
+    return upi, key
 
-def _fam_endpoint_candidates(base, endpoint):
-    base = str(base or '').rstrip('/')
-    endpoint = str(endpoint or '').lstrip('/')
-    urls = [f'{base}/{endpoint}']
-    if not base.lower().endswith('/api'):
-        urls.append(f'{base}/api/{endpoint}')
-    return list(dict.fromkeys(urls))
+def _fam_message(data):
+    if isinstance(data, dict):
+        for k in ('message', 'error', 'msg', 'detail'):
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                return re.sub(r'[^\x20-\x7E]', ' ', v.strip())[:200]
+    return ''
 
+def _fam_amount_equals(value, expected):
+    try:
+        a = Decimal(str(value)); b = Decimal(str(expected))
+        return a.is_finite() and b.is_finite() and a > 0 and a == b
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+def _fam_get(name, params, timeout=10):
+    """GET https://<gateway>/api/<name>. Returns (http_status, json_dict, error)."""
+    try:
+        url = f"{_fam_base_url()}/api/{name}"
+        res = HTTP_SESSION.get(url, params=params, timeout=timeout, allow_redirects=False)
+    except RuntimeError as exc:
+        return None, {}, str(exc)
+    except requests.RequestException as exc:
+        # Only the exception type is logged: the message could contain the API token.
+        print(f'[FAMPAY] {name} network error: {type(exc).__name__}')
+        return None, {}, 'FamPay gateway is not reachable. Please try again.'
+    try:
+        data = res.json()
+    except Exception:
+        data = {}
+    return res.status_code, (data if isinstance(data, dict) else {}), None
 
 def _check_fam_connection():
-    row = _gateway_row('fam')
-    if not row or not row[1] or not row[2]:
-        return False, 'FAMP UPI ID and API token are required.'
-    key = str(row[2] or row[3] or FAM_API_KEY).strip()
-    if not key:
+    upi, key = _fam_credentials()
+    if not upi or not key:
         _set_gateway_connected('fam', False)
-        return False, 'FAMP API token is missing.'
-
-    # A verification request for a deliberately non-existent order is enough to
-    # validate authentication without creating/charging a real payment order.
+        return False, 'FamPay UPI ID and API token are required.'
+    # Verifying a deliberately non-existent order proves the token is accepted
+    # without creating a real payment order.
     dummy = 'CONNECTION_TEST_' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '_' + secrets.token_hex(3)
-    last_detail = 'No response from gateway.'
-    auth_seen = False
-    try:
-        for base in _fam_gateway_base_candidates():
-            for endpoint in ('verify-order.php', 'verify.php'):
-                for url in _fam_endpoint_candidates(base, endpoint):
-                    try:
-                        res = HTTP_SESSION.get(
-                            url,
-                            params={'order_id': dummy, 'api_key': key},
-                            timeout=8,
-                        )
-                        last_detail = f'HTTP {res.status_code}'
-                        try:
-                            data = res.json()
-                        except Exception:
-                            data = {}
-                        status = str(data.get('status') or '').lower() if isinstance(data, dict) else ''
-                        message = str(data.get('message') or status or last_detail)[:300]
-                        last_detail = message
-
-                        if res.status_code in (401, 403):
-                            _set_gateway_connected('fam', False)
-                            return False, message or 'Invalid or unauthorized API token.'
-
-                        # Official FamGateway returns 404 for a non-existent
-                        # order. That is an authenticated response and therefore
-                        # proves the API key is accepted without creating an order.
-                        if res.status_code == 404:
-                            text = json.dumps(data, ensure_ascii=False).lower() if isinstance(data, dict) else ''
-                            if any(x in text for x in ('not_found', 'order_id', 'order not', 'does not exist')):
-                                auth_seen = True
-                                continue
-
-                        if 200 <= res.status_code < 300:
-                            auth_seen = True
-                            if status in {'success', 'pending', 'expired', 'not_found', 'error'} or isinstance(data, dict):
-                                continue
-
-                        if res.status_code >= 500:
-                            continue
-                    except requests.RequestException as exc:
-                        last_detail = str(exc)[:300]
-                        continue
-
-        if auth_seen:
-            _set_gateway_connected('fam', True)
-            return True, 'API token verified successfully.'
-
+    status, data, err = _fam_get('verify.php', {'order_id': dummy, 'api_key': key}, timeout=10)
+    if err:
         _set_gateway_connected('fam', False)
-        return False, last_detail
-    except Exception as e:
+        return False, err
+    msg = _fam_message(data)
+    st = str(data.get('status') or '').lower()
+    text = (msg + ' ' + st).lower()
+    if status in (401, 403):
         _set_gateway_connected('fam', False)
-        return False, str(e)[:300]
+        return False, msg or 'FamPay rejected the API token.'
+    if status is not None and status >= 500:
+        _set_gateway_connected('fam', False)
+        return False, 'FamPay gateway is temporarily unavailable.'
+    order_unknown = (st in {'not_found', 'pending', 'expired'}
+                     or any(x in text for x in ('not found', 'not_found', 'does not exist', 'no such order')))
+    if not order_unknown and any(x in text for x in ('invalid api', 'api key', 'api_key', 'unauthor', 'forbidden', 'invalid key', 'invalid token')):
+        _set_gateway_connected('fam', False)
+        return False, msg or 'FamPay rejected the API token.'
+    if not data:
+        _set_gateway_connected('fam', False)
+        return False, f'FamPay did not return a valid response (HTTP {status}). Check the gateway URL.'
+    _set_gateway_connected('fam', True)
+    return True, 'FamPay API token verified successfully.'
+
 
 def _paytm_json_compact(value):
     # Paytm's published Python examples sign json.dumps(body) and then send the
@@ -2290,314 +2268,26 @@ def _verify_paytm_order(order_id):
     except Exception:
         return False,None,None
 
-ZYVOPAY_BASE_URL = os.getenv('ZYVOPAY_BASE_URL', 'https://zyvopay.site/api').strip().rstrip('/')
-# ZYVO PAY enforces rate limits, so its status polling is slower than the old gateways.
-ZYVO_POLL_INTERVAL = 4.0
-ZYVO_RATE_LIMIT_BACKOFF = 20.0
-_zyvo_backoff_until = 0.0
-_zyvo_last_status_log = {}
-_zyvo_db_lock = threading.Lock()
-
-def get_zyvo_config():
-    row = _gateway_row('zyvo')
-    api_key = str(os.getenv('ZYVOPAY_API_KEY', '') or (row[3] if row else '')).strip()
-    return {'api_key': api_key, 'connected': bool(int(row[4] or 0)) if row else False}
-
-def valid_zyvo_api_key(value):
-    value = str(value or '').strip()
-    public, separator, secret = value.partition('.')
-    return bool(separator and public and secret and not any(char.isspace() for char in value))
-
-def _zyvo_url(endpoint):
-    base = str(ZYVOPAY_BASE_URL or '').strip().rstrip('/')
-    try:
-        parsed = urllib.parse.urlparse(base)
-        parsed.port
-    except ValueError:
-        parsed = None
-    if (not parsed or parsed.scheme != 'https' or parsed.hostname != 'zyvopay.site'
-            or parsed.username or parsed.password or parsed.path.rstrip('/') != '/api'):
-        raise RuntimeError('Invalid ZYVO PAY API URL. Restore https://zyvopay.site/api.')
-    return f"{base}/{str(endpoint or '').lstrip('/')}"
-
-def _zyvo_message(data):
-    """Short, safe error text taken from a ZYVO PAY JSON response."""
-    if isinstance(data, dict):
-        for key in ('error', 'message', 'detail'):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return re.sub(r'[^\x20-\x7E]', ' ', value.strip())[:200]
-    return ''
-
-def _zyvo_unwrap(data):
-    """Some API replies nest the payment under data/payment/result; flatten them."""
-    if not isinstance(data, dict):
-        return {}
-    for key in ('data', 'payment', 'result'):
-        inner = data.get(key)
-        if isinstance(inner, dict) and (inner.get('reference') or inner.get('status') or 'payment_uri' in inner):
-            merged = dict(data)
-            merged.update(inner)
-            return merged
-    return data
-
-def _zyvo_call(endpoint, payload, timeout=12, connection_probe=False):
-    """Signed POST. Returns (data, error, retryable)."""
-    global _zyvo_backoff_until
-    api_key = get_zyvo_config()['api_key']
-    if not valid_zyvo_api_key(api_key):
-        return None, 'ZYVO PAY API key is not configured.', False
-    try:
-        url = _zyvo_url(endpoint)
-        raw_body = json.dumps(payload or {}, separators=(',', ':'), ensure_ascii=False)
-        timestamp = str(int(datetime.datetime.now(datetime.timezone.utc).timestamp()))
-        secret = api_key.partition('.')[2]
-        signature = hmac.new(
-            secret.encode('utf-8'), f'{timestamp}.{raw_body}'.encode('utf-8'), hashlib.sha256
-        ).hexdigest()
-        response = HTTP_SESSION.post(
-            url, data=raw_body.encode('utf-8'),
-            headers={
-                'Content-Type': 'application/json', 'X-API-Key': api_key,
-                'X-Timestamp': timestamp, 'X-Signature': signature,
-            }, timeout=timeout, allow_redirects=False,
-        )
-        try:
-            data = response.json()
-        except Exception:
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        status = response.status_code
-        api_msg = _zyvo_message(data)
-        if connection_probe and status == 404 and 'not found' in api_msg.lower():
-            return {'connection_verified': True}, None, False
-        if 200 <= status < 300:
-            if data.get('success') is False or str(data.get('status') or '').lower() == 'error':
-                print(f'[ZYVO] {endpoint} rejected: {api_msg}')
-                return None, 'ZYVO PAY: ' + (api_msg or 'request was rejected.'), False
-            return data, None, False
-        print(f'[ZYVO] {endpoint} HTTP {status}: {api_msg}')
-        if status in {401, 403}:
-            return None, 'ZYVO PAY rejected the API credentials. Check the API key and the server clock.', False
-        if status == 429:
-            try:
-                wait = float(response.headers.get('Retry-After') or ZYVO_RATE_LIMIT_BACKOFF)
-            except (TypeError, ValueError):
-                wait = ZYVO_RATE_LIMIT_BACKOFF
-            _zyvo_backoff_until = time.time() + max(5.0, min(wait, 120.0))
-            return None, 'ZYVO PAY rate limit reached. Please wait and try again.', False
-        if status == 404:
-            return None, 'ZYVO PAY reference or API endpoint was not found.', False
-        if status >= 500:
-            return None, 'ZYVO PAY is temporarily unavailable. Please try again.', True
-        return None, f'ZYVO PAY rejected the request (HTTP {status})' + (f': {api_msg}' if api_msg else '.'), False
-    except requests.RequestException as exc:
-        print(f'[ZYVO] {endpoint} network error: {type(exc).__name__}')
-        return None, 'ZYVO PAY is temporarily unavailable. Please try again.', True
-    except RuntimeError as exc:
-        return None, str(exc), False
-    except Exception as exc:
-        print(f'[ZYVO] {endpoint} unexpected error: {type(exc).__name__}')
-        return None, 'ZYVO PAY request failed.', False
-
-def _zyvo_request(endpoint, payload, timeout=12, connection_probe=False):
-    data, error, _retryable = _zyvo_call(endpoint, payload, timeout=timeout, connection_probe=connection_probe)
-    return data, error
-
-def _zyvo_amount_equals(value, expected):
-    try:
-        paid = Decimal(str(value))
-        wanted = Decimal(str(expected))
-        return paid.is_finite() and wanted.is_finite() and paid > 0 and paid == wanted
-    except (InvalidOperation, TypeError, ValueError):
-        return False
-
-def _zyvo_payment_mismatch(payload, reference, order_id, amount_inr):
-    """'' when the payload is a verified successful payment, else the reason."""
-    if not isinstance(payload, dict):
-        return 'invalid response'
-    if str(payload.get('status') or '').lower() != 'successful':
-        return 'not successful'
-    if not reference or payload.get('reference') != reference:
-        return 'reference mismatch'
-    if payload.get('order_id') not in (None, '') and str(payload.get('order_id')) != str(order_id):
-        return 'order_id mismatch'
-    if payload.get('currency') not in (None, '') and str(payload.get('currency')).upper() != 'INR':
-        return 'currency mismatch'
-    if payload.get('amount') not in (None, '') and not _zyvo_amount_equals(payload.get('amount'), amount_inr):
-        return 'amount mismatch'
-    return ''
-
-def _zyvo_payment_matches(payload, reference, order_id, amount_inr):
-    return not _zyvo_payment_mismatch(payload, reference, order_id, amount_inr)
-
-# ---- order reference storage (survives a bot restart) ----
-def _zyvo_db():
-    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
-    conn.execute('CREATE TABLE IF NOT EXISTS zyvo_orders(order_id TEXT PRIMARY KEY, reference TEXT NOT NULL, amount REAL, created_at REAL)')
-    return conn
-
-def _zyvo_store_ref(order_id, reference, amount):
-    _zyvo_order_references[str(order_id)] = reference
-    try:
-        with _zyvo_db_lock:
-            conn = _zyvo_db()
-            try:
-                conn.execute('INSERT OR REPLACE INTO zyvo_orders(order_id,reference,amount,created_at) VALUES(?,?,?,?)',
-                             (str(order_id), str(reference), float(amount), time.time()))
-                conn.execute('DELETE FROM zyvo_orders WHERE created_at < ?', (time.time() - 172800,))
-                conn.commit()
-            finally:
-                conn.close()
-    except Exception as exc:
-        print(f'[ZYVO] could not persist reference: {type(exc).__name__}')
-
-def _zyvo_lookup_ref(order_id):
-    order_id = str(order_id)
-    reference = _zyvo_order_references.get(order_id)
-    if reference:
-        return reference
-    try:
-        with _zyvo_db_lock:
-            conn = _zyvo_db()
-            try:
-                row = conn.execute('SELECT reference FROM zyvo_orders WHERE order_id=?', (order_id,)).fetchone()
-            finally:
-                conn.close()
-        if row and row[0]:
-            _zyvo_order_references[order_id] = row[0]
-            return row[0]
-    except Exception as exc:
-        print(f'[ZYVO] could not read reference: {type(exc).__name__}')
-    return None
-
-def _zyvo_connection_test():
-    dummy_reference = 'CONNECTION_TEST_' + secrets.token_hex(8).upper()
-    data, error = _zyvo_request(
-        'check-payment.php', {'reference': dummy_reference}, timeout=10, connection_probe=True
-    )
-    if error or not (isinstance(data, dict) and data.get('connection_verified')):
-        detail = error or 'ZYVO PAY did not confirm the test reference.'
-        _set_gateway_connected('zyvo', False)
-        return False, detail
-    _set_gateway_connected('zyvo', True)
-    return True, 'ZYVO PAY API credentials verified.'
-
-def _zyvo_qr_image_url(value):
-    if not isinstance(value, str) or any(char.isspace() for char in value):
-        return ''
-    try:
-        parsed = urllib.parse.urlparse(value)
-        parsed.port
-    except ValueError:
-        return ''
-    host = (parsed.hostname or '').lower()
-    trusted_host = host == 'zyvopay.site' or host.endswith('.zyvopay.site')
-    if parsed.scheme == 'https' and trusted_host and not parsed.username and not parsed.password:
-        return value
-    return ''
-
-def create_zyvo_qr(amount):
-    amount = round(float(amount), 2)
-    if not _zyvo_amount_equals(amount, amount):
-        raise RuntimeError('Invalid UPI amount.')
-    config = get_zyvo_config()
-    if not config['connected']:
-        raise RuntimeError('ZYVO PAY is not connected. Check ZYVO PAY Connection first.')
-    order_id = 'ZV' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + secrets.token_hex(4).upper()
-    body = {
-        'order_id': order_id,
-        'amount': int(amount) if amount == int(amount) else amount,
-        'customer_name': 'Customer', 'description': BOT_BRAND_NAME[:200], 'expires_in': 10,
-    }
-    data, error = None, None
-    # Same order_id is reused on a network/5xx retry so no duplicate order is created.
-    for attempt in range(2):
-        data, error, retryable = _zyvo_call('create-payment.php', body, timeout=18)
-        if not error or not retryable:
-            break
-        time.sleep(1.5)
-    if error or not isinstance(data, dict):
-        raise RuntimeError(error or 'ZYVO PAY did not return payment details.')
-    data = _zyvo_unwrap(data)
-    reference = data.get('reference')
-    try:
-        valid = (
-            isinstance(reference, str) and bool(reference.strip()) and len(reference) <= 256
-            and data.get('order_id') in (None, '', order_id)
-            and str(data.get('currency') or 'INR').upper() == 'INR'
-            and (data.get('amount') in (None, '') or _zyvo_amount_equals(data.get('amount'), amount))
-        )
-    except (TypeError, ValueError):
-        valid = False
-    if not valid:
-        print('[ZYVO] create-payment response did not match the order')
-        raise RuntimeError('ZYVO PAY returned payment details that did not match this order.')
-
-    payment_uri = data.get('payment_uri')
-    qr_image = None
-    if isinstance(payment_uri, str) and payment_uri:
-        parsed = urllib.parse.urlparse(payment_uri)
-        query = urllib.parse.parse_qs(parsed.query)
-        payee = (query.get('pa') or [''])[0]
-        currency = (query.get('cu') or ['INR'])[0].upper()
-        uri_amount = (query.get('am') or [''])[0]
-        if parsed.scheme != 'upi' or parsed.netloc.lower() != 'pay' or not payee or currency != 'INR' or not _zyvo_amount_equals(uri_amount, amount):
-            raise RuntimeError('ZYVO PAY returned an invalid UPI payment URI.')
-        qr_image = _build_stylish_qr_image(payment_uri)
-    else:
-        qr_image = _zyvo_qr_image_url(data.get('qr_image_url'))
-        if not qr_image:
-            raise RuntimeError('ZYVO PAY returned no usable payment QR. Check the UPI setup in your ZYVO PAY dashboard.')
-    _zyvo_store_ref(order_id, reference, amount)
-    return qr_image, str(order_id)
-
-def _verify_zyvo_order(order_id):
-    order_id = str(order_id)
-    details = active_orders.get(order_id) or active_orders.get(order_id.upper()) or {}
-    if not details:
-        return False, None, None
-    if time.time() < _zyvo_backoff_until:   # rate-limited: wait quietly
-        return False, None, None
-    reference = _zyvo_lookup_ref(order_id)
-    if not reference:
-        return False, None, None
-    data, error = _zyvo_request('check-payment.php', {'reference': reference}, timeout=10)
-    if error:
-        return False, None, None
-    data = _zyvo_unwrap(data)
-    reason = _zyvo_payment_mismatch(data, reference, order_id, details.get('amount'))
-    if reason:
-        status = str(data.get('status') or '').lower()
-        if reason != 'not successful' or status in {'failed', 'expired'}:
-            if _zyvo_last_status_log.get(order_id) != reason + status:
-                _zyvo_last_status_log[order_id] = reason + status
-                print(f'[ZYVO] order {order_id} not credited: {reason} (status={status or "?"})')
-        return False, None, None
-    _zyvo_last_status_log.pop(order_id, None)
-    utr_value = str(data.get('utr') or data.get('bank_txn_id') or data.get('transaction_id') or 'N/A')
-    utr = re.sub(r'[^A-Za-z0-9._/-]', '', utr_value)[:80] or 'N/A'
-    return True, utr, 'ZYVO PAY UPI'
-
 def _payment_poll_gap(gateway):
-    return ZYVO_POLL_INTERVAL if str(gateway or '').lower() == 'zyvo' else PAYMENT_POLL_INTERVAL
+    return PAYMENT_POLL_INTERVAL
 
 def _check_gateway_connection(gateway):
     g=str(gateway).lower()
-    return _zyvo_connection_test() if g=='zyvo' else (False,'Only ZYVO PAY is available in this bot.')
+    if g=='fam': return _check_fam_connection()
+    if g=='paytm': return _check_paytm_connection()
+    return (False,'Unknown payment gateway.')
 
 def _create_active_gateway_qr(amount):
     gw=_get_active_payment_gateway()
-    if gw=='zyvo': return create_zyvo_qr(amount)
-    raise RuntimeError('ZYVO PAY is not active. Check the gateway connection and turn it ON.')
+    if gw=='fam': return create_fam_qr(amount)
+    if gw=='paytm': return _create_paytm_dynamic_qr(amount)
+    raise RuntimeError('No payment gateway is ON. Open Admin Panel > FamPay Gateway, check the connection and turn it ON.')
 
 def _verify_active_gateway_order(order_id,gateway=None):
     details=active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
     gw=str(gateway or details.get('gateway') or _get_active_payment_gateway()).lower()
     if gw=='fam': return verify_fam_order(order_id)
     if gw=='paytm': return _verify_paytm_order(order_id)
-    if gw=='zyvo': return _verify_zyvo_order(order_id)
     return False,None,None
 
 
@@ -7087,119 +6777,79 @@ def _extract_gateway_qr_payload(data, qr_url, order_id, amount, fam_upi):
 
 
 def create_fam_qr(amount):
-    """Create a FAM order and return a styled QR image + the same order id.
-
-    The gateway still creates the real order and verify_fam_order() still checks
-    that exact order id. Only the visual QR image is changed.
-    """
-    amount = float(amount)
-    _fam_cfg = _gateway_row("fam")
-    _fam_api_key = (_fam_cfg[2] if _fam_cfg and _fam_cfg[2] else (_fam_cfg[3] if _fam_cfg and _fam_cfg[3] else FAM_API_KEY))
-    _fam_upi = (_fam_cfg[1] if _fam_cfg and _fam_cfg[1] else RECEIVER_UPI)
-
-    try:
-        # Official FamGateway v2 uses /api/qr.php. Keep the older
-        # /create_order.php endpoint as a compatibility fallback for an
-        # explicitly configured legacy gateway.
-        create_urls = []
-        for base in _fam_gateway_base_candidates():
-            create_urls.extend(_fam_endpoint_candidates(base, 'qr.php'))
-            create_urls.extend(_fam_endpoint_candidates(base, 'create_order.php'))
-        create_urls = list(dict.fromkeys(create_urls))
-
-        last_error = None
-        for endpoint_url in create_urls:
-            try:
-                res = HTTP_SESSION.get(
-                    endpoint_url,
-                    params={"amount": f"{amount:.2f}", "api_key": _fam_api_key},
-                    timeout=10,
-                )
-                if res.status_code in (401, 403):
-                    raise RuntimeError('FamGateway API token was rejected.')
-                res.raise_for_status()
-                res_json = res.json()
-                data = res_json.get("data") or {}
-
-                if res_json.get("status") == "success" or res_json.get("status") is True:
-                    qr_url = data.get("qr_url") or data.get("qr")
-                    order_id = data.get("order_id")
-
-                    if qr_url and order_id:
-                        payload = _extract_gateway_qr_payload(
-                            data, qr_url, order_id, amount, _fam_upi
-                        )
-                        try:
-                            return _build_stylish_qr_image(payload), str(order_id)
-                        except Exception as style_error:
-                            print(f"Styled QR warning: {style_error}")
-
-                        # Absolute final fallback: keep the original gateway QR.
-                        return qr_url, str(order_id)
-                last_error = res_json
-            except Exception as endpoint_error:
-                last_error = endpoint_error
-                continue
-        if last_error:
-            print(f"Gateway QR Error: {last_error}")
-    except Exception as e:
-        print(f"Gateway QR Error: {e}")
-
-    # Original direct-UPI fallback retained for gateway/API outages.
-    order_id = (
-        "FAM"
-        + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        + str(random.randint(1000, 9999))
-    )
-    upi_uri = (
-        f"upi://pay?pa={urllib.parse.quote(_fam_upi, safe='@')}"
-        f"&pn={urllib.parse.quote(BOT_BRAND_NAME)}"
-        f"&am={amount:.2f}&cu=INR&tn={urllib.parse.quote(order_id)}"
-    )
-
-    try:
-        return _build_stylish_qr_image(upi_uri), order_id
-    except Exception as style_error:
-        print(f"Fallback styled QR warning: {style_error}")
-        fallback_qr = (
-            "https://api.qrserver.com/v1/create-qr-code/"
-            f"?size=500x500&data={urllib.parse.quote(upi_uri, safe='')}"
-        )
-        return fallback_qr, order_id
+    """Create a FamPay order (GET /api/create_order.php) and return the bot's own
+    black/white QR image together with the gateway's order_id."""
+    amount = round(float(amount), 2)
+    if not amount > 0:
+        raise RuntimeError('Invalid UPI amount.')
+    upi, key = _fam_credentials()
+    if not key:
+        raise RuntimeError('FamPay API token is not configured.')
+    last_error = 'FamPay could not create the payment order. Please try again.'
+    for attempt in range(2):
+        status, data, err = _fam_get('create_order.php', {'amount': f'{amount:.2f}', 'api_key': key}, timeout=12)
+        if err:
+            last_error = err
+            time.sleep(1)
+            continue
+        if status in (401, 403):
+            raise RuntimeError('FamPay rejected the API token. Re-enter it in the FamPay Gateway settings.')
+        if status is not None and status >= 500:
+            last_error = 'FamPay gateway is temporarily unavailable. Please try again.'
+            time.sleep(1)
+            continue
+        body = data.get('data') if isinstance(data.get('data'), dict) else {}
+        ok = data.get('status') is True or str(data.get('status') or '').lower() == 'success'
+        if not (ok and body.get('order_id')):
+            msg = _fam_message(data)
+            print(f'[FAMPAY] create_order rejected (HTTP {status}): {msg}')
+            raise RuntimeError('FamPay: ' + msg if msg else last_error)
+        order_id = str(body['order_id'])
+        if body.get('amount') not in (None, '') and not _fam_amount_equals(body.get('amount'), amount):
+            raise RuntimeError('FamPay returned a different amount for this order.')
+        qr_url = str(body.get('qr_url') or body.get('qr') or '').strip()
+        try:
+            qr_host = (urllib.parse.urlparse(qr_url).hostname or '').lower()
+            base_host = (urllib.parse.urlparse(_fam_base_url()).hostname or '').lower()
+        except Exception:
+            qr_host = base_host = ''
+        if not (qr_url.startswith('https://') and qr_host and (qr_host == base_host or qr_host.endswith('.' + base_host))):
+            qr_url = ''   # never fetch or show images from an untrusted host
+        payee = str(body.get('upi_id') or upi).strip()
+        if not payee and not qr_url:
+            raise RuntimeError('FamPay UPI ID is not configured.')
+        payload = _extract_gateway_qr_payload(body, qr_url, order_id, amount, payee)
+        try:
+            return _build_stylish_qr_image(payload), order_id
+        except Exception as style_error:
+            print(f'[FAMPAY] styled QR failed: {style_error}')
+            if qr_url:
+                return qr_url, order_id
+            raise RuntimeError('FamPay QR could not be generated.')
+    raise RuntimeError(last_error)
 
 def verify_fam_order(order_id):
-    _fam_cfg = _gateway_row("fam")
-    _fam_api_key = (_fam_cfg[2] if _fam_cfg and _fam_cfg[2] else (_fam_cfg[3] if _fam_cfg and _fam_cfg[3] else FAM_API_KEY))
-    if not _fam_api_key or not order_id:
+    """GET /api/verify.php. Paid only when status is success and the amount matches."""
+    upi, key = _fam_credentials()
+    order_id = str(order_id or '')
+    if not key or not order_id:
         return False, None, None
-
-    for base in _fam_gateway_base_candidates():
-        for endpoint in ('verify-order.php', 'verify.php'):
-            for verify_url in _fam_endpoint_candidates(base, endpoint):
-                try:
-                    res = HTTP_SESSION.get(
-                        verify_url,
-                        params={'order_id': str(order_id), 'api_key': _fam_api_key},
-                        timeout=10,
-                    )
-                    if res.status_code in (401, 403):
-                        return False, None, None
-                    res_json = res.json()
-                    if res_json.get('status') == 'success' or res_json.get('status') is True:
-                        data = res_json.get('data') or {}
-                        utr = data.get('utr', 'N/A')
-                        sender = data.get('sender_name', 'UPI User')
-                        return True, utr, sender
-                    # A valid endpoint that says pending/expired is a normal
-                    # negative result; do not jump to a different endpoint and
-                    # accidentally reinterpret it.
-                    if res.status_code in (200, 404, 408) and isinstance(res_json, dict):
-                        status = str(res_json.get('status') or '').lower()
-                        if status in {'pending', 'expired', 'not_found'}:
-                            return False, None, None
-                except Exception:
-                    continue
-    return False, None, None
+    status, data, err = _fam_get('verify.php', {'order_id': order_id, 'api_key': key}, timeout=10)
+    if err or status in (401, 403) or not data:
+        return False, None, None
+    if not (data.get('status') is True or str(data.get('status') or '').lower() == 'success'):
+        return False, None, None   # pending / expired / not found
+    body = data.get('data') if isinstance(data.get('data'), dict) else {}
+    if body.get('order_id') not in (None, '') and str(body.get('order_id')) != order_id:
+        return False, None, None
+    details = active_orders.get(order_id) or active_orders.get(order_id.upper()) or {}
+    expected = details.get('amount')
+    if expected is not None and body.get('amount') not in (None, '') and not _fam_amount_equals(body.get('amount'), expected):
+        print(f'[FAMPAY] order {order_id} paid amount does not match the order; not credited')
+        return False, None, None
+    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(body.get('utr') or 'N/A'))[:80] or 'N/A'
+    sender = str(body.get('sender_name') or 'FamPay UPI')
+    return True, utr, sender
 
 def _handle_paid_key_delivery_failure(chat_id, user_id, order_id, amount, pay_type, product_name, product_days, reason='API did not return a key'):
     """Notify admins and compensate a verified paid order exactly once."""
@@ -7408,7 +7058,6 @@ def poll_payment_in_bot(chat_id, user_id, message_id, order_id, amount, pay_type
     start_time = time.time()
     while time.time() - start_time < PAYMENT_TIMEOUT_SECONDS: 
         if order_id not in active_orders:
-            _zyvo_order_references.pop(str(order_id), None)
             return  
             
         active_details = active_orders.get(order_id) or {}
@@ -7430,14 +7079,12 @@ def poll_payment_in_bot(chat_id, user_id, message_id, order_id, amount, pay_type
                     time.sleep(_payment_poll_gap(order_gateway))
                     continue
             active_orders.pop(order_id, None)
-            _zyvo_order_references.pop(str(order_id), None)
             process_successful_payment(chat_id, user_id, message_id, order_id, amount, pay_type, utr, product_id, device_id)
             return
         time.sleep(_payment_poll_gap(order_gateway))
     
     if order_id in active_orders:
         order_details = active_orders.pop(order_id, None)
-        _zyvo_order_references.pop(str(order_id), None)
         if str(pay_type) == 'reseller_activation':
             with reseller_qr_lock:
                 session=reseller_qr_sessions.get(int(chat_id))
@@ -11179,85 +10826,19 @@ def _handle_paytm_setup_message(message):
         admin_temp_data.pop(uid, None)
 
 
-def _start_zyvo_setup(chat_id, user_id):
-    if not _is_admin(user_id):
-        return
-    admin_temp_data[int(user_id)] = {'zyvo_setup_stage': 'api_key'}
-    bot.send_message(
-        chat_id,
-        '💳 <b>ZYVO PAY UPI GATEWAY</b>\n\n'
-        'Send the ZYVO PAY API key in <code>public.secret</code> format. '
-        'Use <code>/cancel</code> to stop setup.',
-        parse_mode='HTML',
-    )
-
-@bot.message_handler(func=lambda message: bool(
-    getattr(message, 'from_user', None) and
-    _is_admin(message.from_user.id) and
-    isinstance(admin_temp_data.get(int(message.from_user.id)), dict) and
-    admin_temp_data.get(int(message.from_user.id), {}).get('zyvo_setup_stage')
-))
-def _handle_zyvo_setup_message(message):
-    uid = int(message.from_user.id)
-    chat_id = message.chat.id
-    text = (message.text or '').strip()
-    command = text.split()[0].lower() if text else ''
-    if command in {'/cancel', '/admin', '/start'}:
-        admin_temp_data.pop(uid, None)
-        try:
-            bot.clear_step_handler_by_chat_id(chat_id)
-        except Exception:
-            pass
-        if command == '/cancel':
-            bot.send_message(chat_id, '✅ <b>ZYVO PAY setup cancelled.</b>', parse_mode='HTML')
-            _send_gateway_manager(chat_id)
-        elif command == '/admin':
-            admin_panel(message)
-        else:
-            send_welcome(message)
-        return
-    if not valid_zyvo_api_key(text):
-        bot.send_message(
-            chat_id,
-            '❌ Invalid ZYVO PAY API key. Send the complete <code>public.secret</code> key again.',
-            parse_mode='HTML',
-        )
-        return
-    try:
-        _save_gateway('zyvo', '', 'zyvo', text)
-        admin_temp_data.pop(uid, None)
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-        bot.send_message(
-            chat_id,
-            '💾 <b>ZYVO PAY API key saved.</b>\n\n'
-            'ZYVO PAY remains <b>OFF</b> until you check the connection and turn it ON.',
-            parse_mode='HTML', reply_markup=_gateway_manager_markup(),
-        )
-    except Exception as exc:
-        admin_temp_data.pop(uid, None)
-        _set_gateway_connected('zyvo', False)
-        bot.send_message(
-            chat_id,
-            f'❌ <b>ZYVO PAY save failed.</b>\n\n<code>{html.escape(str(exc)[:400])}</code>',
-            parse_mode='HTML', reply_markup=_gateway_manager_markup(),
-        )
-
 def _gateway_manager_markup():
     active=_get_active_payment_gateway()
     m=types.InlineKeyboardMarkup(row_width=1)
-    m.row(make_ui_button(f"{'🟢' if active=='zyvo' else '⚪'} ZYVO PAY Gateway\n{_gateway_status_line('zyvo')}", callback_data='gw_edit_zyvo', button_key='admin:gateway:zyvo_edit', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔍 Check ZYVO PAY Connection', callback_data='gw_check_zyvo', button_key='admin:gateway:zyvo_check', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔘 ZYVO PAY System '+('ON' if active=='zyvo' else 'OFF'), callback_data='gw_toggle_zyvo', button_key='admin:gateway:zyvo_toggle', default_color='green' if active=='zyvo' else 'red', force_style=True))
+    m.row(make_ui_button(f"{'🟢' if active=='fam' else '⚪'} FamPay Gateway\n{_gateway_status_line('fam')}", callback_data='gw_edit_fam', button_key='admin:gateway:fam_edit', default_color='blue', force_style=True))
+    m.row(make_ui_button('🔍 Check FamPay Connection', callback_data='gw_check_fam', button_key='admin:gateway:fam_check', default_color='blue', force_style=True))
+    m.row(make_ui_button('🔘 FamPay System '+('ON' if active=='fam' else 'OFF'), callback_data='gw_toggle_fam', button_key='admin:gateway:fam_toggle', default_color='green' if active=='fam' else 'red', force_style=True))
     m.row(make_ui_button('⏳ Pending Payments', callback_data='admin_view_pending_payments', button_key='admin:gateway:pending', default_color='blue', force_style=True))
     m.row(make_ui_button('🔙 Main Admin Panel', callback_data='admin_back_main', button_key='admin:navigation:back', default_color='red', force_style=True))
     return m
 
 def _send_gateway_manager(chat_id,message_id=None):
-    active=_get_active_payment_gateway(); label='ZYVO PAY' if active=='zyvo' else 'None'
-    text=f"💳 <b>PAYMENT GATEWAY</b>\n\n⚡ <b>Active Gateway:</b> {label}\nZYVO PAY handles UPI payments for this bot."
+    active=_get_active_payment_gateway(); label='FamPay' if active=='fam' else ('PayTM' if active=='paytm' else 'None')
+    text=f"💳 <b>PAYMENT GATEWAY</b>\n\n⚡ <b>Active Gateway:</b> {label}\nFamPay handles UPI payments for this bot."
     markup=_gateway_manager_markup()
     if message_id:
         try: return bot.edit_message_text(text,chat_id=chat_id,message_id=message_id,parse_mode='HTML',reply_markup=markup)
@@ -11308,27 +10889,28 @@ def step_save_paytm_client_id(message):
 
 def _gateway_toggle(chat_id,gateway):
     gateway=str(gateway).lower().strip(); row=_gateway_row(gateway)
-    if gateway != 'zyvo':
-        bot.send_message(chat_id,'❌ <b>Only ZYVO PAY is available in this bot.</b>',parse_mode='HTML')
+    label={'fam':'FamPay','paytm':'PayTM'}.get(gateway,gateway.upper())
+    if gateway not in {'fam','paytm'}:
+        bot.send_message(chat_id,'❌ <b>Unknown payment gateway.</b>',parse_mode='HTML')
         _send_gateway_manager(chat_id)
         return
     if _get_active_payment_gateway() == gateway:
         set_setting('active_payment_gateway','')
-        bot.send_message(chat_id,f'⚪ <b>{gateway.upper()} System OFF.</b>',parse_mode='HTML')
+        bot.send_message(chat_id,f'⚪ <b>{label} System OFF.</b>',parse_mode='HTML')
         _send_gateway_manager(chat_id)
         return
-    configured = bool(get_zyvo_config()['api_key']) if gateway == 'zyvo' else bool(row and row[1] and row[2])
+    configured = bool(row and row[1] and row[2])
     if not row or not configured:
-        bot.send_message(chat_id,f'❌ <b>{gateway.upper()} is not configured.</b>',parse_mode='HTML'); return
+        bot.send_message(chat_id,f'❌ <b>{label} is not configured.</b>',parse_mode='HTML'); return
     if not int(row[4] or 0):
-        bot.send_message(chat_id,f'❌ <b>{gateway.upper()} is not connected.</b> Use Check Connection first.',parse_mode='HTML'); return
+        bot.send_message(chat_id,f'❌ <b>{label} is not connected.</b> Use Check Connection first.',parse_mode='HTML'); return
     if gateway=='paytm':
         ready=_paytm_payment_config_error()
         if ready:
             bot.send_message(chat_id,'❌ <b>PayTM cannot be turned ON yet.</b>\n\n'+html.escape(ready),parse_mode='HTML'); return
     if not _set_active_payment_gateway(gateway):
-        bot.send_message(chat_id,f'❌ <b>{gateway.upper()} could not be activated.</b>',parse_mode='HTML'); return
-    bot.send_message(chat_id,f'🟢 <b>{gateway.upper()} System ON.</b> The other gateway is automatically OFF.',parse_mode='HTML')
+        bot.send_message(chat_id,f'❌ <b>{label} could not be activated.</b>',parse_mode='HTML'); return
+    bot.send_message(chat_id,f'🟢 <b>{label} System ON.</b> The other gateway is automatically OFF.',parse_mode='HTML')
     _send_gateway_manager(chat_id)
 
 
@@ -18381,36 +17963,36 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
 
     elif call.data == "admin_gateway_manager":
         if _is_admin(user_id): _send_gateway_manager(call.message.chat.id, message_id=call.message.message_id)
-    elif call.data in {"gw_edit_fam", "gw_edit_paytm", "gw_check_fam", "gw_check_paytm", "gw_toggle_fam", "gw_toggle_paytm"}:
+    elif call.data == "gw_edit_fam":
         if _is_admin(user_id):
             _fast_callback_ack(call)
-            bot.send_message(call.message.chat.id, 'Only ZYVO PAY is available in this bot.')
-            _send_gateway_manager(call.message.chat.id, message_id=call.message.message_id)
-    elif call.data == "gw_edit_zyvo":
-        if _is_admin(user_id):
-            _fast_callback_ack(call)
-            _start_zyvo_setup(call.message.chat.id, user_id)
-    elif call.data == "gw_check_zyvo":
+            _start_famp_setup(call.message.chat.id, user_id)
+    elif call.data == "gw_check_fam":
         if _is_admin(user_id):
             _fast_callback_ack(call)
             chat_id = call.message.chat.id
             message_id = call.message.message_id
-            def _zyvo_connection_worker():
-                ok, detail = _zyvo_connection_test()
+            def _fam_connection_worker():
+                ok, detail = _check_fam_connection()
                 try:
                     bot.send_message(
                         chat_id,
                         ("✅" if ok else "❌") +
-                        f" <b>ZYVO PAY Connection {'Successful' if ok else 'Failed'}</b>\n\n"
+                        f" <b>FamPay Connection {'Successful' if ok else 'Failed'}</b>\n\n"
                         f"<code>{html.escape(str(detail))}</code>",
                         parse_mode='HTML',
                     )
                     _send_gateway_manager(chat_id, message_id=message_id)
                 except Exception as exc:
-                    print(f'[ZYVO CONNECTION UI ERROR] {exc}')
-            _run_user_task_async(_zyvo_connection_worker)
-    elif call.data == "gw_toggle_zyvo":
-        if _is_admin(user_id): _gateway_toggle(call.message.chat.id,"zyvo")
+                    print(f'[FAMPAY CONNECTION UI ERROR] {exc}')
+            _run_user_task_async(_fam_connection_worker)
+    elif call.data == "gw_toggle_fam":
+        if _is_admin(user_id): _gateway_toggle(call.message.chat.id, "fam")
+    elif call.data in {"gw_edit_paytm", "gw_check_paytm", "gw_toggle_paytm"}:
+        if _is_admin(user_id):
+            _fast_callback_ack(call)
+            bot.send_message(call.message.chat.id, 'Only FamPay is available in this bot.')
+            _send_gateway_manager(call.message.chat.id, message_id=call.message.message_id)
     elif call.data == "admin_manage_admins":
         if _is_admin(user_id): _send_admin_manager(call.message.chat.id, message_id=call.message.message_id)
     elif call.data == "admin_add_id":
