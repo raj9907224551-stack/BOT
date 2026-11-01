@@ -836,7 +836,7 @@ def _render_admin_parent_screen(chat_id, user_id):
             plans = get_product_plans(product_name)
             lines = [f"🎮 <b>{html.escape(product_name)}</b>", "━━━━━━━━━━━━━━━━━━━━", f"📦 <b>{len(plans)} Plan(s)</b>", ""]
             for idx, plan in enumerate(plans, 1):
-                lines.append(f"{idx}. 📅 <b>{html.escape(str(plan[2]))}</b>  ·  User ₹{plan[3]:.2f}  ·  Reseller ₹{plan[4]:.2f}")
+                lines.append(f"{idx}. 📅 <b>{html.escape(str(plan[2]))}</b>  ·  ₹{plan[4]:.2f}")
             markup = _pp_selected_hack_screen(uid, product_name)
             text = "\n".join(lines)
         elif cb == "admin_hack_day_mgmt":
@@ -1622,6 +1622,23 @@ def init_db():
     conn.close()
 
 init_db()
+
+
+def _migrate_reseller_only_pricing():
+    """Make the old User price column equal the Reseller price (idempotent)."""
+    try:
+        conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
+        try:
+            conn.execute("UPDATE products SET resell_price = price WHERE COALESCE(resell_price,0)=0 AND COALESCE(price,0)>0")
+            conn.execute("UPDATE products SET price = resell_price WHERE COALESCE(resell_price,0)>0 AND COALESCE(price,0)<>resell_price")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[reseller-only pricing migration] {exc}")
+
+
+_migrate_reseller_only_pricing()
 
 # Protected template used when creating customer bots.  A database backup or
 # restore performed later on the Master Bot must never become the source for
@@ -4489,6 +4506,7 @@ def modify_user_balance_manual(user_id, amount, is_add=True):
     conn.close()
 
 def add_product_db(name, pid_id, days, price, resell_price, is_manual=0, remote_duration=''):
+    price = resell_price  # reseller-only pricing: single price for everyone
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
     cursor = conn.cursor()
     cursor.execute('SELECT MAX(display_order) FROM products')
@@ -4556,6 +4574,7 @@ def update_product_name_db(old_name, new_name):
     return True, 'Hack name updated successfully.'
 
 def update_product_price_db(plan_id, new_price, new_resell_price):
+    new_price = new_resell_price  # reseller-only pricing: single price for everyone
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
     cursor = conn.cursor()
     cursor.execute('UPDATE products SET price = ?, resell_price = ? WHERE id = ?', (new_price, new_resell_price, plan_id))
@@ -4884,6 +4903,594 @@ def _legacy_global_api_source_ready(product_name, plan_id=None):
     # contract, so it is considered ready after an explicit connection test.
     return True
 
+
+
+# ==================== ADVANCE API SYSTEM ====================
+# Bearer-token REST provider:  GET /api/v1/balance, GET /api/v1/catalog,
+# POST /api/v1/generate {product_id, quantity, idempotency_key}.
+# - Per-hack ON/OFF toggle. While ON, every plan of that hack that is linked to a
+#   catalog product is delivered by Advance API; the older servers are simply put
+#   on hold (their settings are untouched) and work again as soon as it is OFF.
+# - Plans of an ON hack that are NOT linked keep using the previous server.
+# - Stock never depends on the provider balance (no "out of stock" on low balance).
+ADV_API_URL_KEY = 'adv_api_url'
+ADV_API_TOKEN_KEY = 'adv_api_token'
+ADV_API_ENABLED_MAP_KEY = 'adv_api_enabled_map'   # {hack name: bool}
+ADV_API_PLAN_MAP_KEY = 'adv_api_plan_map'         # {local plan id: remote product_id}
+_ADV_CATALOG_CACHE = {'ts': 0.0, 'data': None}
+_ADV_CATALOG_TTL = 600
+_ADV_PAGE_SIZE = 16
+
+
+def _adv_json_get(key):
+    try:
+        data = json.loads(get_setting(key) or '{}')
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _adv_json_set(key, data):
+    set_setting(key, json.dumps(data, ensure_ascii=False, separators=(',', ':')))
+
+
+def _adv_base_url(value=None):
+    raw = value if value is not None else get_setting(ADV_API_URL_KEY)
+    url = str(raw or '').strip().strip('`').strip()
+    if url and not re.match(r'^https?://', url, re.I) and re.match(r'^[\w.-]+\.[a-z]{2,}(:\d+)?(/.*)?$', url, re.I):
+        url = 'https://' + url
+    if not re.match(r'^https?://', url, re.I):
+        return ''
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        return ''
+    path = parsed.path.rstrip('/')
+    low = path.lower()
+    for suffix in ('/api/v1/generate', '/api/v1/catalog', '/api/v1/balance', '/api/v1', '/api'):
+        if low.endswith(suffix):
+            path = path[:-len(suffix)]
+            break
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path.rstrip('/'), '', '', ''))
+
+
+def _adv_api_token():
+    return str(get_setting(ADV_API_TOKEN_KEY) or '').strip()
+
+
+def _adv_connected():
+    return str(get_setting('adv_api_connected') or '0') == '1'
+
+
+def _adv_enabled_map():
+    return _adv_json_get(ADV_API_ENABLED_MAP_KEY)
+
+
+def _adv_hack_enabled(product_name):
+    return bool(_adv_enabled_map().get(str(product_name), False))
+
+
+def _adv_set_hack_enabled(product_name, enabled):
+    data = _adv_enabled_map()
+    data[str(product_name)] = bool(enabled)
+    _adv_json_set(ADV_API_ENABLED_MAP_KEY, data)
+
+
+def _adv_plan_map():
+    return _adv_json_get(ADV_API_PLAN_MAP_KEY)
+
+
+def _adv_plan_remote_id(plan_id):
+    if plan_id is None:
+        return ''
+    return str(_adv_plan_map().get(str(plan_id), '') or '').strip()
+
+
+def _adv_set_plan_remote_id(plan_id, remote_id):
+    data = _adv_plan_map()
+    if remote_id:
+        data[str(plan_id)] = str(remote_id).strip()
+    else:
+        data.pop(str(plan_id), None)
+    _adv_json_set(ADV_API_PLAN_MAP_KEY, data)
+
+
+def _adv_hack_by_hash(value):
+    for name in get_unique_products():
+        if _ui_hash(name) == str(value):
+            return name
+    return None
+
+
+def _adv_norm(text):
+    return re.sub(r'\s+', ' ', str(text or '')).strip().lower()
+
+
+def _adv_dur_key(text):
+    """Comparable key for a duration label: '1 Day' == '1 day' == '1 Days'."""
+    t = _adv_norm(text)
+    m = re.fullmatch(r'(\d+)\s*([a-z]+)', t)
+    if m:
+        n, u = int(m.group(1)), m.group(2)
+        if u in ('h', 'hr', 'hrs', 'hour', 'hours'):
+            return (n, 'h')
+        if u in ('d', 'day', 'days'):
+            return (n, 'd')
+        if u in ('w', 'wk', 'week', 'weeks'):
+            return (n, 'w')
+        if u in ('mo', 'month', 'months'):
+            return (n, 'mo')
+        if u in ('y', 'yr', 'year', 'years'):
+            return (n, 'y')
+    if t.isdigit():
+        return (int(t), 'd')   # legacy bare number = days
+    return ('t', t)
+
+
+def _adv_headers(has_body=False):
+    headers = {
+        'Authorization': f'Bearer {_adv_api_token()}',
+        'Accept': 'application/json',
+        'User-Agent': 'RG-Cheat-Shop-Bot/AdvanceAPI',
+    }
+    if has_body:
+        headers['Content-Type'] = 'application/json'
+    return headers
+
+
+def _adv_request(method, path, payload=None, timeout=20):
+    """Return (http_status_or_None, data_dict, error_text). error_text == '' means success."""
+    base, token = _adv_base_url(), _adv_api_token()
+    if not token:
+        return None, {}, 'API Token is not configured.'
+    if not base:
+        return None, {}, 'Invalid Server Link.'
+    try:
+        resp = HTTP_SESSION.request(method, f'{base}/api/v1{path}', headers=_adv_headers(payload is not None),
+                                    json=payload, timeout=timeout, allow_redirects=True)
+    except Exception as exc:
+        return None, {}, f'Network error: {str(exc)[:250]}'
+    raw = (resp.text or '').strip()
+    data = _api_server_parse_json(resp)
+    if not isinstance(data, dict):
+        data = {}
+    err = ''
+    if data.get('ok') is False or (data.get('error') and data.get('ok') is not True):
+        e = data.get('error')
+        msg = e.get('message') if isinstance(e, dict) else e
+        err = str(msg or 'Request failed')[:300]
+    elif resp.status_code not in (200, 201):
+        err = f'HTTP {resp.status_code}: {raw[:200]}'
+    elif not data:
+        err = f'Unexpected reply: {raw[:200] or "empty"}'
+    elif data.get('ok') is not True:
+        err = 'Unexpected reply format.'
+    return resp.status_code, data, err
+
+
+def _adv_money(value):
+    try:
+        return f'{float(value):,.2f}'
+    except Exception:
+        return str(value)
+
+
+def _adv_check_connection():
+    status, data, err = _adv_request('GET', '/balance', timeout=15)
+    if err:
+        set_setting('adv_api_connected', '0')
+        return False, err, data
+    set_setting('adv_api_connected', '1')
+    info = data.get('data') if isinstance(data.get('data'), dict) else {}
+    return True, _adv_balance_text(info) if info else 'Authentication successful.', data
+
+
+def _adv_balance_text(info):
+    if not isinstance(info, dict) or info.get('balance') is None:
+        return 'Balance not provided by server.'
+    text = f"{_adv_money(info.get('balance'))} {info.get('currency') or ''}".strip()
+    if info.get('balance_usd') is not None:
+        text += f" (≈ ${_adv_money(info.get('balance_usd'))})"
+    return f'Balance: {text}'
+
+
+def _adv_get_catalog(force=False):
+    """Return (list_of_entries_or_None, error_text). Cached for 10 minutes."""
+    cached = _ADV_CATALOG_CACHE.get('data')
+    if not force and cached is not None and time.time() - float(_ADV_CATALOG_CACHE.get('ts') or 0) < _ADV_CATALOG_TTL:
+        return cached, ''
+    status, data, err = _adv_request('GET', '/catalog', timeout=25)
+    if err:
+        return cached, err
+    products = (data.get('data') or {}).get('products') if isinstance(data.get('data'), dict) else None
+    clean = []
+    for p in (products or []):
+        if not isinstance(p, dict):
+            continue
+        pid = p.get('product_id')
+        name = str(p.get('product_name') or '').strip()
+        dur = str(p.get('duration') or '').strip()
+        if pid in (None, '') or not name or not dur:
+            continue
+        clean.append({'pid': str(pid), 'name': name, 'duration': dur, 'price': p.get('price')})
+    _ADV_CATALOG_CACHE['data'] = clean
+    _ADV_CATALOG_CACHE['ts'] = time.time()
+    return clean, ''
+
+
+def _adv_group_catalog(entries):
+    groups = {}
+    for e in entries or []:
+        groups.setdefault(e['name'], []).append(e)
+    return groups
+
+
+def _adv_import_product(remote_name, entries):
+    """Create/link the bot hack + plans for one catalog product.
+
+    Existing hack (same name) and existing plan (same duration) keep their prices.
+    New plans get price 0 / reseller 0 and are hidden until the admin sets prices
+    and unhides them, so nothing can be sold for free by accident.
+    """
+    existing_name = None
+    for n in get_unique_products():
+        if _adv_norm(n) == _adv_norm(remote_name):
+            existing_name = n
+            break
+    created_hack = existing_name is None
+    local_name = existing_name or str(remote_name).strip()[:200]
+    plan_map = _adv_plan_map()
+    linked = created = skipped = 0
+    seen = set()
+    now_text = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
+    try:
+        for e in entries:
+            key = _adv_dur_key(e['duration'])
+            if key in seen:
+                skipped += 1
+                continue
+            seen.add(key)
+            rows = conn.execute('SELECT id, days FROM products WHERE name=? ORDER BY id', (local_name,)).fetchall()
+            match = None
+            for r in rows:
+                if _adv_dur_key(r[1]) == key:
+                    match = int(r[0])
+                    break
+            if match is None:
+                order = conn.execute('SELECT COALESCE(MAX(display_order),0)+1 FROM products').fetchone()[0]
+                cur = conn.execute(
+                    '''INSERT INTO products(name,pid_id,days,price,resell_price,is_manual,discount_percent,
+                                            remote_duration,tg_group_link,is_out_of_stock,require_device_id,display_order)
+                       VALUES(?,?,?,?,?,0,0,?,'',0,0,?)''',
+                    (local_name, '0', e['duration'], 0, 0, e['duration'], int(order or 1)))
+                match = int(cur.lastrowid)
+                conn.execute(
+                    '''INSERT INTO plan_visibility(plan_id,hidden,updated_at) VALUES(?,1,?)
+                       ON CONFLICT(plan_id) DO UPDATE SET hidden=1,updated_at=excluded.updated_at''',
+                    (match, now_text))
+                created += 1
+            else:
+                linked += 1
+            plan_map[str(match)] = e['pid']
+        if created_hack:
+            conn.execute(
+                '''INSERT INTO product_visibility(product_name,hidden,updated_at) VALUES(?,1,?)
+                   ON CONFLICT(product_name) DO UPDATE SET hidden=1,updated_at=excluded.updated_at''',
+                (local_name, now_text))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    _adv_json_set(ADV_API_PLAN_MAP_KEY, plan_map)
+    if created_hack:
+        # A brand-new hack has no previous server, so it starts on Advance API.
+        _adv_set_hack_enabled(local_name, True)
+    return {'name': local_name, 'created_hack': created_hack, 'linked': linked, 'created': created, 'skipped': skipped}
+
+
+def _adv_import_text(res):
+    lines = [f"✅ <b>{html.escape(res['name'])}</b> imported", '']
+    if res['created_hack']:
+        lines.append('🆕 New hack created — hidden until you set prices.')
+        lines.append('🟢 Advance API is ON for this hack.')
+    else:
+        lines.append('🔗 Linked to your existing hack (your prices are untouched).')
+        lines.append('⚪ Advance API is still OFF for it — turn it ON below when you want to use it.')
+    lines.append(f"🔗 Linked existing plans: <b>{res['linked']}</b>")
+    lines.append(f"➕ New plans (price 0, hidden): <b>{res['created']}</b>")
+    if res['skipped']:
+        lines.append(f"⏭ Duplicate durations skipped: {res['skipped']}")
+    if res['created']:
+        lines.append('\n<i>Set the prices in Edit Product Prices, then unhide the plan/hack.</i>')
+    return '\n'.join(lines)
+
+
+def _adv_route_active(product_name, plan_id):
+    if not product_name or plan_id is None:
+        return False
+    if not _adv_api_token() or not _adv_base_url():
+        return False
+    if not _adv_hack_enabled(product_name):
+        return False
+    return bool(_adv_plan_remote_id(plan_id))
+
+
+def _adv_source_ready_for_plan(product_name, plan_id=None):
+    # Deliberately independent of the provider balance: low balance never shows "Out of Stock".
+    if not _adv_route_active(product_name, plan_id):
+        return False
+    if _product_hidden(product_name) or _plan_hidden(plan_id):
+        return False
+    return True
+
+
+def _adv_generate_key(remote_product_id, purchase_ref=None):
+    ref = purchase_ref or f'RG-{time.time_ns()}-{random.randint(100000, 999999)}'
+    # Same purchase_ref => same idempotency key, so a retry can never charge twice.
+    idem = 'rg-' + hashlib.sha256(f'advance|{ref}'.encode()).hexdigest()[:40]
+    pid = str(remote_product_id).strip()
+    payload = {'product_id': int(pid) if pid.isdigit() else pid, 'quantity': 1, 'idempotency_key': idem}
+    for attempt in (1, 2):
+        status, data, err = _adv_request('POST', '/generate', payload, timeout=30)
+        if not err:
+            keys = (data.get('data') or {}).get('keys') if isinstance(data.get('data'), dict) else None
+            for k in (keys or []):
+                if isinstance(k, dict):
+                    k = k.get('key') or k.get('license_key')
+                if k and str(k).strip():
+                    return str(k).strip()
+            print(f'[ADVANCE API] generate ok but no key in reply ref={ref} product={pid}: {str(data)[:500]}')
+            return None
+        print(f'[ADVANCE API] generate attempt {attempt} failed ref={ref} product={pid} status={status}: {err}')
+        if status is None or status >= 500:
+            time.sleep(1.5)
+            continue
+        break
+    return None
+
+
+def _adv_panel_text():
+    token, raw_url = _adv_api_token(), str(get_setting(ADV_API_URL_KEY) or '').strip()
+    url = _adv_base_url() if raw_url else ''
+    status = '🟢 Connected Successfully' if _adv_connected() else '🔴 Not Connected'
+    token_line = f'<code>{html.escape(token[:6])}••••••</code>' if token else '<i>Not Set</i>'
+    url_line = f'<code>{html.escape(url)}</code>' if url else '<i>Not Set</i>'
+    emap = _adv_enabled_map()
+    active = [n for n in get_unique_products() if emap.get(n)]
+    hacks_line = html.escape(', '.join(active)) if active else '<i>None</i>'
+    return ('🚀 <b>ADVANCE API SYSTEM</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+            f'📡 <b>Status:</b> {status}\n🌐 <b>Server:</b> {url_line}\n🔑 <b>API Token:</b> {token_line}\n'
+            f'🎮 <b>Active Hacks:</b> {hacks_line}\n\n'
+            '<i>Select Product imports hacks/plans from the server. Connect Hack turns Advance API ON/OFF per hack — '
+            'OFF brings the previous API back.</i>')
+
+
+def _adv_api_markup():
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(_admin_colorful_button('🔑 API Token & Link', callback_data='adv_set_token', color='green'),
+          _admin_colorful_button('🔍 Check Connect', callback_data='adv_check', color='green'))
+    m.row(_admin_colorful_button('💰 Check Balance', callback_data='adv_balance', color='green'),
+          _admin_colorful_button('🛒 Select Product', callback_data='adv_catalog', color='blue'))
+    m.add(_admin_colorful_button('🎮 Connect Hack (ON / OFF)', callback_data='adv_hacks', color='green'))
+    m.row(_admin_colorful_button('✏️ Edit Token', callback_data='adv_edit_token', color='blue'),
+          _admin_colorful_button('🌐 Edit Link', callback_data='adv_edit_url', color='blue'))
+    m.add(_admin_colorful_button('🗑 Delete API', callback_data='adv_delete', color='red'))
+    m.add(_admin_colorful_button('🔙 API & Servers', callback_data='admin_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m))
+
+
+def _send_adv_panel(call):
+    _admin_ui_send(call, _adv_panel_text(), parse_mode='HTML', reply_markup=_adv_api_markup())
+
+
+def _adv_send_panel_message(chat_id):
+    bot.send_message(chat_id, _adv_panel_text(), parse_mode='HTML', reply_markup=_adv_api_markup())
+
+
+def _adv_catalog_markup(groups, page):
+    names = list(groups.keys())
+    pages = max(1, (len(names) + _ADV_PAGE_SIZE - 1) // _ADV_PAGE_SIZE)
+    page = max(0, min(int(page), pages - 1))
+    linked_ids = set(str(v) for v in _adv_plan_map().values())
+    m = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    for name in names[page * _ADV_PAGE_SIZE:(page + 1) * _ADV_PAGE_SIZE]:
+        entries = groups[name]
+        done = all(e['pid'] in linked_ids for e in entries)
+        buttons.append(_admin_colorful_button(f"{'✅' if done else '⬇️'} {name} ({len(entries)})"[:60],
+                                              callback_data=f'adv_pick_{_ui_hash(name)}',
+                                              color='green' if done else 'blue'))
+    for i in range(0, len(buttons), 2):
+        m.row(*buttons[i:i + 2])
+    nav = []
+    if page > 0:
+        nav.append(_admin_colorful_button('◀️ Prev', callback_data=f'adv_cat_{page - 1}', color='blue'))
+    if page < pages - 1:
+        nav.append(_admin_colorful_button('Next ▶️', callback_data=f'adv_cat_{page + 1}', color='blue'))
+    if nav:
+        m.row(*nav)
+    m.add(_admin_colorful_button('📥 Import All Products', callback_data='adv_import_all', color='green'))
+    m.add(_admin_colorful_button('🔄 Refresh List', callback_data='adv_cat_refresh', color='blue'))
+    m.add(_admin_colorful_button('🔙 Advance API System', callback_data='adv_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m)), page, pages
+
+
+def _adv_catalog_text(groups, page, pages):
+    total_plans = sum(len(v) for v in groups.values())
+    return ('🛒 <b>SELECT PRODUCT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+            f'📦 Products: <b>{len(groups)}</b> · Plans: <b>{total_plans}</b> · Page {page + 1}/{pages}\n\n'
+            'Tap a product to import it into the bot (Hack → Plans).\n'
+            '⬇️ = not imported yet · ✅ = already linked\n'
+            '<i>Same-name hacks/plans keep your prices. New ones come with price 0 (hidden).</i>')
+
+
+def _adv_hacks_markup():
+    pm = _adv_plan_map()
+    emap = _adv_enabled_map()
+    m = types.InlineKeyboardMarkup(row_width=2)
+    count = 0
+    for name in get_unique_products():
+        if not any(str(r[0]) in pm for r in get_product_plans(name)):
+            continue
+        on = bool(emap.get(name))
+        m.add(_admin_colorful_button(f"{'🟢' if on else '⚪'} {name}"[:60], callback_data=f'adv_hack_{_ui_hash(name)}',
+                                     color='green' if on else 'blue'))
+        count += 1
+    m.add(_admin_colorful_button('🔙 Advance API System', callback_data='adv_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m)), count
+
+
+def _adv_hack_view(product_name):
+    on = _adv_hack_enabled(product_name)
+    pm = _adv_plan_map()
+    lines = [f'🎮 <b>{html.escape(product_name)}</b>', '',
+             f"🚀 <b>Advance API:</b> {'🟢 ON (linked plans use Advance API)' if on else '⚪ OFF (previous API in use)'}",
+             '', '<b>Plans</b> (tap a plan to edit / unlink its server product ID):']
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(_admin_colorful_button('🔴 Turn OFF — use previous API' if on else '🟢 Turn ON — use Advance API',
+                                 callback_data=f'adv_toggle_{_ui_hash(product_name)}',
+                                 color='red' if on else 'green'))
+    for row in get_product_plans(product_name):
+        plan_id, days = int(row[0]), str(row[2])
+        rid = pm.get(str(plan_id))
+        lines.append(f"• {html.escape(days)} → {('<code>#' + html.escape(str(rid)) + '</code>') if rid else 'previous API'}")
+        m.add(_admin_colorful_button(f"{'🟢' if rid else '⚪'} {days} | Server ID: {rid or 'none'}"[:60],
+                                     callback_data=f'adv_plan_{_ui_hash(product_name)}_{plan_id}',
+                                     color='green' if rid else 'blue'))
+    m.add(_admin_colorful_button('🗑 Remove Advance Link', callback_data=f'adv_remove_{_ui_hash(product_name)}', color='red'))
+    m.add(_admin_colorful_button('🔙 Hack List', callback_data='adv_hacks', color='red'))
+    return '\n'.join(lines), _style_admin_markup(_ensure_admin_back_button(m))
+
+
+def _adv_step_guard(message, retry_handler=None):
+    uid = int(message.from_user.id)
+    if not _is_admin(uid):
+        return None
+    text = (message.text or '').strip()
+    if _is_command_input(text):
+        _cancel_pending_id_step(uid)
+        admin_temp_data.pop(uid, None)
+        if text.lower().split()[0] == '/start':
+            send_welcome(message)
+        else:
+            bot.send_message(message.chat.id, 'ℹ️ Entry cancelled. Open Advance API System again.')
+        return None
+    if not text:
+        if retry_handler:
+            m = bot.send_message(message.chat.id, '❌ Value cannot be empty. Enter it again.')
+            bot.register_next_step_handler(m, retry_handler)
+        return None
+    return text
+
+
+def _adv_delete_secret(message):
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+
+
+def _adv_report_connection(chat_id):
+    ok, detail, _ = _adv_check_connection()
+    bot.send_message(chat_id,
+                     f"{'🟢 <b>Connected Successfully!</b>' if ok else '🔴 <b>Not Connected</b>'}\nℹ️ {html.escape(str(detail))}",
+                     parse_mode='HTML')
+    _adv_send_panel_message(chat_id)
+
+
+def step_save_adv_token(message):
+    text = _adv_step_guard(message, step_save_adv_token)
+    if text is None:
+        return
+    uid = int(message.from_user.id)
+    _adv_delete_secret(message)
+    admin_temp_data.setdefault(uid, {})['adv_token'] = text
+    m = bot.send_message(message.chat.id,
+                         '🌐 <b>Enter Advance API Server Link:</b>\n\nExample: <code>https://adminshops.com</code>',
+                         parse_mode='HTML')
+    bot.register_next_step_handler(m, step_save_adv_url)
+
+
+def step_save_adv_url(message):
+    text = _adv_step_guard(message, step_save_adv_url)
+    if text is None:
+        return
+    uid = int(message.from_user.id)
+    token = str(admin_temp_data.get(uid, {}).get('adv_token') or _adv_api_token()).strip()
+    url = _adv_base_url(text)
+    if not token:
+        m = bot.send_message(message.chat.id, '❌ API Token is missing. Send the token again.')
+        bot.register_next_step_handler(m, step_save_adv_token)
+        return
+    if not url:
+        m = bot.send_message(message.chat.id, '❌ Invalid Server Link. Send a valid http:// or https:// link.')
+        bot.register_next_step_handler(m, step_save_adv_url)
+        return
+    set_setting(ADV_API_TOKEN_KEY, token)
+    set_setting(ADV_API_URL_KEY, url)
+    set_setting('adv_api_connected', '0')
+    _ADV_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
+    admin_temp_data.pop(uid, None)
+    _adv_report_connection(message.chat.id)
+
+
+def step_edit_adv_token(message):
+    text = _adv_step_guard(message, step_edit_adv_token)
+    if text is None:
+        return
+    _adv_delete_secret(message)
+    set_setting(ADV_API_TOKEN_KEY, text)
+    set_setting('adv_api_connected', '0')
+    _ADV_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
+    _adv_report_connection(message.chat.id)
+
+
+def step_edit_adv_url(message):
+    text = _adv_step_guard(message, step_edit_adv_url)
+    if text is None:
+        return
+    url = _adv_base_url(text)
+    if not url:
+        m = bot.send_message(message.chat.id, '❌ Invalid Server Link. Send a valid http:// or https:// link.')
+        bot.register_next_step_handler(m, step_edit_adv_url)
+        return
+    set_setting(ADV_API_URL_KEY, url)
+    set_setting('adv_api_connected', '0')
+    _ADV_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
+    _adv_report_connection(message.chat.id)
+
+
+def step_save_adv_plan_id(message):
+    text = _adv_step_guard(message, step_save_adv_plan_id)
+    if text is None:
+        return
+    uid = int(message.from_user.id)
+    data = admin_temp_data.get(uid, {})
+    product_name, plan_id = data.get('adv_product'), data.get('adv_plan_id')
+    if not product_name or plan_id is None:
+        bot.send_message(message.chat.id, '❌ Session expired. Open Connect Hack again.')
+        return
+    if text == '0':
+        _adv_set_plan_remote_id(plan_id, '')
+        note = '🗑 Plan unlinked — it uses the previous API again.'
+    elif text.isdigit():
+        cached = _ADV_CATALOG_CACHE.get('data')
+        if cached and not any(e['pid'] == text for e in cached):
+            m = bot.send_message(message.chat.id, '❌ That ID is not in the server catalog. Send a valid ID, or 0 to unlink.')
+            bot.register_next_step_handler(m, step_save_adv_plan_id)
+            return
+        _adv_set_plan_remote_id(plan_id, text)
+        note = f'✅ Server product ID saved: <code>{html.escape(text)}</code>'
+    else:
+        m = bot.send_message(message.chat.id, '❌ Send the numeric server product ID, or 0 to unlink.')
+        bot.register_next_step_handler(m, step_save_adv_plan_id)
+        return
+    admin_temp_data.pop(uid, None)
+    bot.send_message(message.chat.id, note, parse_mode='HTML')
+    view, markup = _adv_hack_view(product_name)
+    bot.send_message(message.chat.id, view, parse_mode='HTML', reply_markup=markup)
 
 
 # ==================== TobiX SELLER API SYSTEM ====================
@@ -5901,6 +6508,7 @@ def _api_source_ready_for_plan(product_name, plan_id=None, local_pid_id=None):
     backward compatibility during an actual delivery request.
     """
     return any((
+        _adv_source_ready_for_plan(product_name, plan_id),
         _banti_source_ready_for_plan(product_name, plan_id),
         _licence_hub_source_ready_for_plan(product_name, plan_id),
         _ninex_source_ready_for_plan(product_name, plan_id),
@@ -5939,6 +6547,25 @@ def _refresh_multi_api_connection_if_needed(product_name, plan_id=None):
     return ok
 
 
+def _stock_display_label(manual_count, api_ready):
+    """Customer-facing stock text.
+
+    No "(Auto-API)" / "(Manual)" wording is ever shown.
+    - Auto-API connected  -> "In Stock"
+    - Manual keys 1..3    -> "<n> Stock Available" (e.g. "3 Stock Available")
+    - Manual keys > 3     -> "In Stock"
+    """
+    if api_ready:
+        return "In Stock"
+    try:
+        manual_count = int(manual_count or 0)
+    except (TypeError, ValueError):
+        manual_count = 0
+    if 0 < manual_count <= 3:
+        return f"{manual_count} Stock Available"
+    return "In Stock"
+
+
 def _plan_stock_state(product):
     """Return (is_out_of_stock, status_text) using real manual/API sources.
 
@@ -5958,9 +6585,9 @@ def _plan_stock_state(product):
     if int(is_oos or 0) == 1:
         return True, "Out of Stock"
     if manual_count > 0:
-        return False, f"{manual_count} Available (Manual)"
+        return False, _stock_display_label(manual_count, _api_source_ready_for_plan(product[1], int(p_id), pid_id))
     if _api_source_ready_for_plan(product[1], int(p_id), pid_id):
-        return False, "In Stock (Auto-API)"
+        return False, "In Stock"
     return True, "Out of Stock"
 
 
@@ -6414,6 +7041,9 @@ def fetch_key_from_api(pid_id, duration, android_id=None, product_name=None, pla
     curr_api_key = route['api_key']
     remote_product_id = route['product_id']
     valid_id = route.get('valid_id', '')
+
+    if route.get('server_type') == 'advance':
+        return _adv_generate_key(remote_product_id, purchase_ref=purchase_ref)
 
     if route.get('server_type') == 'banti':
         return _banti_generate_key(product_name, plan_id, duration, android_id=android_id, purchase_ref=purchase_ref)
@@ -7494,7 +8124,7 @@ def _admin_return_category_for_callback(data):
         return ("hack_server", "")
     if data in {"new_server_api", "admin_api_system", "admin_server_api_mgmt",
                 "api_srv_add", "tobix_api_system", "tobix_set_token", "tobix_set_url",
-                "tobix_check", "tobix_products"} or data.startswith(("api_srv_", "api_check_", "api_test_", "api_balance_", "new_server_", "tobix_", "banti_", "licence_hub")):
+                "tobix_check", "tobix_products"} or data.startswith(("api_srv_", "api_check_", "api_test_", "api_balance_", "new_server_", "tobix_", "banti_", "adv_", "licence_hub")):
         return ("api", "")
 
     # Payment gateway and admin-account screens.
@@ -10366,9 +10996,9 @@ def _pp_custom_price_plan_markup(user_id, product_name, h):
     for plan in plans:
         pid, _, days, reg, res = plan[:5]
         custom = get_custom_plan_price(user_id, pid)
-        suffix = " · 🟣 Custom" if custom["user_price"] is not None or custom["reseller_price"] is not None else ""
+        suffix = " · 🟣 Custom" if custom["reseller_price"] is not None else ""
         markup.add(types.InlineKeyboardButton(
-            f"📅 {days} · ₹{reg:.2f} / ₹{res:.2f}{suffix}",
+            f"📅 {days} · ₹{res:.2f}{suffix}",
             callback_data=f"pp_custom_price_plan_{pid}_{h}"
         ))
     markup.add(types.InlineKeyboardButton("🔙 Back to Hack", callback_data=f"pp_hack_{h}"))
@@ -10390,15 +11020,92 @@ def step_custom_price_user_id(message):
         bot.send_message(message.chat.id, "❌ Custom Price session expired. Open the selected Hack again.", parse_mode="HTML")
         return
     data["pp_custom_price_target"] = target
-    fake = type("CustomPriceCall", (), {"message": message, "from_user": message.from_user, "data": "pp_custom_price_target"})()
-    _admin_ui_send(
-        fake,
-        "💰 <b>CUSTOM PRICE — SELECT PLAN</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    plans = get_product_plans(product_name)
+    if not plans:
+        bot.send_message(message.chat.id, "❌ This product has no plans.", parse_mode="HTML")
+        return
+    data["pp_custom_price_plan_ids"] = [int(p[0]) for p in plans]
+    lines = []
+    for i, plan in enumerate(plans, 1):
+        pid, _, days, _reg, res = plan[:5]
+        custom = get_custom_plan_price(target, pid)
+        cur = custom["reseller_price"]
+        cur_txt = f"₹{cur:.2f} (custom)" if cur is not None else f"₹{float(res or 0):.2f} (standard)"
+        lines.append(f"{i}. 📅 <b>{html.escape(str(days))}</b> → {cur_txt}")
+    n = len(plans)
+    example = " | ".join(["100"] * n)
+    msg = bot.send_message(
+        message.chat.id,
+        "💰 <b>CUSTOM PRICE — ALL PLANS AT ONCE</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎮 <b>Product:</b> {html.escape(product_name)}\n"
         f"👤 <b>User ID:</b> <code>{target}</code>\n\n"
-        "Select the plan whose price you want to customize.",
-        parse_mode="HTML",
-        reply_markup=_pp_custom_price_plan_markup(target, product_name, h)
+        + "\n".join(lines) +
+        f"\n\nSend <b>{n}</b> prices in the same order, separated by <code>|</code>\n"
+        f"Example: <code>{example}</code>\n"
+        "• <code>-</code> = keep as it is\n"
+        "• <code>clear</code> = remove custom price (back to standard)",
+        parse_mode="HTML"
+    )
+    bot.register_next_step_handler(msg, step_save_custom_plan_prices_bulk)
+
+
+def step_save_custom_plan_prices_bulk(message):
+    uid = message.from_user.id; data = admin_temp_data.get(uid, {})
+    target = data.get("pp_custom_price_target"); plan_ids = data.get("pp_custom_price_plan_ids") or []
+    product_name = data.get("pp_custom_price_product")
+    if not target or not plan_ids:
+        bot.send_message(message.chat.id, "❌ Custom Price session expired. Open Custom Price again.", parse_mode="HTML")
+        return
+    raw = (message.text or "").strip()
+    try:
+        parts = [x.strip() for x in raw.split("|")]
+        if len(parts) != len(plan_ids):
+            raise ValueError
+        actions = []
+        for v in parts:
+            low = v.lower()
+            if low in {"-", "skip", "keep"}:
+                actions.append(("keep", None))
+            elif low in {"clear", "none", "reset", "x"}:
+                actions.append(("clear", None))
+            else:
+                val = float(v)
+                if val < 0: raise ValueError
+                actions.append(("set", val))
+    except Exception:
+        retry = bot.send_message(
+            message.chat.id,
+            f"❌ <b>Invalid format.</b> Send exactly <b>{len(plan_ids)}</b> values separated by <code>|</code>\n"
+            "Example: <code>" + " | ".join(["100"] * len(plan_ids)) + "</code>\n"
+            "<code>-</code> = keep, <code>clear</code> = remove custom price.",
+            parse_mode="HTML")
+        bot.register_next_step_handler(retry, step_save_custom_plan_prices_bulk)
+        return
+    summary = []
+    for plan_id, (act, val) in zip(plan_ids, actions):
+        plan = get_product_by_id(plan_id)
+        label = html.escape(str(plan[3] if plan else plan_id))
+        if act == "set":
+            set_custom_plan_price(target, plan_id, None, val)
+            summary.append(f"📅 {label} → ₹{val:.2f}")
+        elif act == "clear":
+            set_custom_plan_price(target, plan_id, None, None)
+            summary.append(f"📅 {label} → Standard")
+    selected_product = str(product_name or _pp_active_product(uid) or '').strip()
+    if selected_product:
+        _pp_set_active_product(uid, selected_product)
+    admin_temp_data.pop(uid, None)
+    admin_pending_return[uid] = {
+        "callback": "pp_hack_direct",
+        "product_name": selected_product
+    } if selected_product else ({"callback": "pp_hacks"})
+    _admin_success_send(
+        message.chat.id,
+        "✅ <b>CUSTOM PRICES SAVED</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎮 <b>Product:</b> {html.escape(str(product_name))}\n"
+        f"👤 <b>User ID:</b> <code>{int(target)}</code>\n\n"
+        + ("\n".join(summary) if summary else "No changes (all kept)."),
+        parse_mode="HTML"
     )
 
 
@@ -10408,17 +11115,15 @@ def step_save_custom_plan_price(message):
     product_name = data.get("pp_custom_price_product")
     raw = (message.text or "").strip()
     try:
-        parts = [x.strip() for x in raw.split("|")]
-        if len(parts) != 2: raise ValueError
-        def parse_side(v):
-            if v.lower() in {"", "-", "none", "clear"}: return None
-            val = float(v)
-            if val < 0: raise ValueError
-            return val
-        up, rp = parse_side(parts[0]), parse_side(parts[1])
-        set_custom_plan_price(target, plan_id, up, rp)
+        v = raw.strip()
+        if v.lower() in {"", "-", "none", "clear"}:
+            rp = None
+        else:
+            rp = float(v)
+            if rp < 0: raise ValueError
+        set_custom_plan_price(target, plan_id, None, rp)
     except Exception:
-        retry = bot.send_message(message.chat.id, "❌ <b>Invalid format.</b> Use <code>User_Price | Reseller_Price</code>\nExample: <code>500 | 350</code>\nUse <code>-</code> to clear an override.", parse_mode="HTML")
+        retry = bot.send_message(message.chat.id, "❌ <b>Invalid price.</b> Example: <code>350</code> (or <code>-</code> to clear).", parse_mode="HTML")
         bot.register_next_step_handler(retry, step_save_custom_plan_price)
         return
     plan = get_product_by_id(plan_id); custom = get_custom_plan_price(target, plan_id)
@@ -10440,7 +11145,6 @@ def step_save_custom_plan_price(message):
         f"🎮 <b>Product:</b> {html.escape(str(product_name))}\n"
         f"👤 <b>User ID:</b> <code>{int(target)}</code>\n"
         f"📅 <b>Plan:</b> {html.escape(str(plan[3] if plan else plan_id))}\n"
-        f"💰 <b>User Price:</b> {'₹%.2f' % custom['user_price'] if custom['user_price'] is not None else 'Standard'}\n"
         f"💎 <b>Reseller Price:</b> {'₹%.2f' % custom['reseller_price'] if custom['reseller_price'] is not None else 'Standard'}",
         parse_mode="HTML"
     )
@@ -10471,6 +11175,7 @@ def _admin_category_markup(category):
             ("9️⃣ 9X API System", "ninex_api_system"),
             ("🟢 TobiX API System", "tobix_api_system"),
             (f"🟣 {_banti_name()}", "banti_api_system"),
+            ("🚀 Advance API System", "adv_api_system"),
             ("🆕 New Server API System", "new_server_api"),
             ("🤝 Reseller API System", "resapi_admin"),
             ("🔌 Admin Licence Manager Hub", "licence_hub"),
@@ -11063,20 +11768,17 @@ def step_save_existing_hack_price(message):
     uid = message.from_user.id
     plan_id = admin_temp_data.get(uid, {}).get('edit_plan_id')
     try:
-        parts = [x.strip() for x in (message.text or '').split('|')]
-        if len(parts) != 2:
-            raise ValueError
-        user_price = float(parts[0])
-        reseller_price = float(parts[1])
-        if user_price < 0 or reseller_price < 0:
+        reseller_price = float((message.text or '').strip())
+        user_price = reseller_price
+        if reseller_price < 0:
             raise ValueError
     except ValueError:
-        m = bot.send_message(message.chat.id, '❌ <b>Invalid format.</b> Use: <code>User_Price | Reseller_Price</code>', parse_mode='HTML')
+        m = bot.send_message(message.chat.id, '❌ <b>Invalid price.</b> Send only the Reseller Price, e.g. <code>250</code>', parse_mode='HTML')
         bot.register_next_step_handler(m, step_save_existing_hack_price)
         return
     update_product_price_db(plan_id, user_price, reseller_price)
     admin_temp_data.pop(uid, None)
-    _admin_success_send(message.chat.id, f"✅ <b>Existing hack price updated.</b>\n\n💰 User: ₹{user_price:.2f}\n💎 Reseller: ₹{reseller_price:.2f}", parse_mode='HTML')
+    _admin_success_send(message.chat.id, f"✅ <b>Price updated.</b>\n\n💎 Reseller Price: ₹{reseller_price:.2f}", parse_mode='HTML')
 
 
 # ==================== STEP-BY-STEP ADMIN HANDLERS ====================
@@ -11100,16 +11802,14 @@ def step_process_user_reset(message):
 def step_edit_product_price(message):
     user_id = message.from_user.id
     try:
-        prices = [p.strip() for p in message.text.strip().split('|')]
-        if len(prices) != 2:
-            raise ValueError
-        new_price, new_resell_price = float(prices[0]), float(prices[1])
+        new_resell_price = float(message.text.strip().split('|')[-1].strip())
+        new_price = new_resell_price
         plan_id = admin_temp_data[user_id]['plan_id']
         update_product_price_db(plan_id, new_price, new_resell_price)
-        _admin_success_send(message.chat.id, f"✅ <b>Price Updated Successfully!</b>\n\n💰 <b>New Regular Price:</b> ₹{new_price:.2f} INR\n💎 <b>New Reseller Price:</b> ₹{new_resell_price:.2f} INR", parse_mode="HTML")
+        _admin_success_send(message.chat.id, f"✅ <b>Price Updated Successfully!</b>\n\n💎 <b>New Reseller Price:</b> ₹{new_resell_price:.2f} INR", parse_mode="HTML")
         del admin_temp_data[user_id]
     except Exception:
-        msg = bot.send_message(message.chat.id, "❌ <b>Format Error!</b> Enter price in format: <code>User_Price | Reseller_Price</code>\nExample: <code>200 | 150</code>")
+        msg = bot.send_message(message.chat.id, "❌ <b>Format Error!</b> Send only the Reseller Price.\nExample: <code>150</code>")
         bot.register_next_step_handler(msg, step_edit_product_price)
 
 def step_quick_setup(message):
@@ -11125,14 +11825,15 @@ def step_quick_setup(message):
         count = 0
         for line in lines[1:]:
             parts = line.split('|')
-            if len(parts) == 4:
-                days, server_dur, u_price, r_price = [p.strip() for p in parts]
-                add_product_db(hack_name, pid_id, days, float(u_price), float(r_price), is_manual=0, remote_duration=server_dur)
+            if len(parts) in (3, 4):
+                vals = [p.strip() for p in parts]
+                days, server_dur, r_price = vals[0], vals[1], vals[-1]
+                add_product_db(hack_name, pid_id, days, float(r_price), float(r_price), is_manual=0, remote_duration=server_dur)
                 count += 1
 
         bot.send_message(message.chat.id, f"✅ <b>Quick Setup Completed!</b>\n\n🎮 <b>Hack:</b> {hack_name}\n🆔 <b>Product ID:</b> <code>{pid_id}</code>\n📦 <b>Plans Added:</b> {count}", parse_mode="HTML")
     except Exception:
-        msg = bot.send_message(message.chat.id, "❌ <b>Format Error!</b> Please follow exact format:\n\n<code>Product_ID | Hack Name\n1 Hours | 1 Hours | 100 | 80\n1 DaYs | 1 DaYs | 500 | 400</code>")
+        msg = bot.send_message(message.chat.id, "❌ <b>Format Error!</b> Please follow exact format:\n\n<code>Product_ID | Hack Name\n1 Hours | 1 Hours | 80\n1 DaYs | 1 DaYs | 400</code>")
         bot.register_next_step_handler(msg, step_quick_setup)
 
 def step_set_tg_group_link(message):
@@ -11188,15 +11889,15 @@ def step_add_hack_name(message):
 def step_add_hack_days(message):
     user_id = message.from_user.id
     admin_temp_data[user_id]['days'] = message.text.strip()
-    msg = bot.send_message(message.chat.id, "💰 <b>Enter Regular User Price in INR (₹)</b> (e.g., <code>250</code>):", parse_mode="HTML")
+    msg = bot.send_message(message.chat.id, "💎 <b>Enter Reseller Price in INR (₹)</b> (e.g., <code>250</code>):", parse_mode="HTML")
     bot.register_next_step_handler(msg, step_add_hack_price)
 
 def step_add_hack_price(message):
     user_id = message.from_user.id
     try:
         admin_temp_data[user_id]['price'] = float(message.text.strip())
-        msg = bot.send_message(message.chat.id, "💎 <b>Enter Reseller Discounted Price in INR (₹)</b> (e.g., <code>125</code>):", parse_mode="HTML")
-        bot.register_next_step_handler(msg, step_add_hack_resell_price)
+        # Reseller-only pricing: the single price entered is the reseller price.
+        return step_add_hack_resell_price(message)
     except ValueError:
         msg = bot.send_message(message.chat.id, "❌ Invalid price! Enter a valid number:")
         bot.register_next_step_handler(msg, step_add_hack_price)
@@ -11233,7 +11934,6 @@ def step_add_hack_resell_price(message):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🎮 <b>Hack:</b> {html.escape(str(product_name))}\n"
             f"📅 <b>Plan:</b> {html.escape(str(data['days']))}\n"
-            f"💰 <b>User Price:</b> ₹{data['price']:.2f}\n"
             f"💎 <b>Reseller Price:</b> ₹{resell_price:.2f}\n\n"
             "<i>Add another duration, or open the hack to manage everything.</i>",
             parse_mode="HTML", reply_markup=markup
@@ -11245,7 +11945,7 @@ def step_add_hack_resell_price(message):
 def step_get_add_day_to_hack(message):
     user_id = message.from_user.id
     admin_temp_data[user_id]['days'] = message.text.strip()
-    msg = bot.send_message(message.chat.id, "💰 <b>Enter Regular User Price in INR (₹):</b>", parse_mode="HTML")
+    msg = bot.send_message(message.chat.id, "💎 <b>Enter Reseller Price in INR (₹):</b>", parse_mode="HTML")
     bot.register_next_step_handler(msg, step_add_hack_price)
 
 
@@ -12416,6 +13116,11 @@ def _resolve_multi_api_route(product_name, plan_id=None, local_pid_id=None, dura
 # Replace route resolution at runtime with a wrapper that preserves the old
 # New Server and Old Server fallbacks exactly as before.
 def _resolve_api_route(product_name, plan_id=None, local_pid_id=None, duration=None):
+    # Advance API: when ON for a hack, its linked plans are delivered by Advance API and
+    # every other server stays on hold. Turn it OFF to go back to the previous server.
+    if _adv_route_active(product_name, plan_id):
+        return {'url': _adv_base_url(), 'api_key': _adv_api_token(),
+                'product_id': _adv_plan_remote_id(plan_id), 'valid_id': '', 'server_type': 'advance'}
     # Banti has the highest priority: while a hack is enabled for Banti, every
     # other server stays on hold for that hack. Disable it to go back.
     if (product_name and not _product_hidden(product_name) and _banti_product_enabled(product_name)
@@ -13035,7 +13740,7 @@ def step_save_hack_price_ui_title(message):
         f"🛒 <b>Hack:</b> {html.escape(product_name)}\n"
         "✨ Your Premium emojis and custom text are saved exactly as sent.\n"
         "📦 Plans/prices are automatic.\n"
-        "📊 Manual / Auto-API stock is automatic.\n"
+        "📊 Stock text is automatic (In Stock / N Stock Available).\n"
         "❌ Out of Stock is automatic.\n"
         "🏷️ Discounts are automatic.\n\n"
         "Old normal price-list text is no longer used for this hack.",
@@ -13224,7 +13929,7 @@ def step_save_global_price_list_template(message):
             "• Premium custom emojis are preserved.\n"
             "• Old duplicated/manual price rows are removed from the template.\n"
             "• Every hack automatically injects its own Admin-configured plans/prices.\n"
-            "• Stock automatically shows Manual stock when manual keys exist, otherwise Auto-API.\n"
+            "• Stock shows N Stock Available when 1-3 manual keys are left, otherwise In Stock.\n"
             "• Discounted hacks stay Green; normal hacks stay Blue.\n\n"
             "Use <code>{pricing_info}</code> anywhere you want the live price list inserted.",
             parse_mode="HTML"
@@ -13956,7 +14661,7 @@ def show_product_plans(chat_id, product_name, message_id=None):
     global_disc_val = float(get_setting('global_discount') or '0.0')
     user_disc_val = user[12] if user and len(user) > 12 else 0.0
     ref_disc_used = user[15] if user and len(user) > 15 else 0
-    is_reseller = user[11] if user and len(user) > 11 else 0
+    is_reseller = 1  # Unified pricing: every customer sees the Reseller price only
 
     pricing_info = ""
     buttons = []
@@ -13997,11 +14702,11 @@ def show_product_plans(chat_id, product_name, message_id=None):
 
         custom_price = get_custom_plan_price(chat_id, p_id)
         if is_reseller == 1 and custom_price["reseller_price"] is not None:
-            final_price = custom_price["reseller_price"]; discount_tag = " <i>(Custom Reseller Rate)</i>"
+            final_price = custom_price["reseller_price"]; discount_tag = ""
         elif is_reseller == 0 and custom_price["user_price"] is not None:
             final_price = custom_price["user_price"]; discount_tag = " <i>(Custom User Rate)</i>"
         elif is_reseller == 1:
-            final_price = resell_price; discount_tag = " <i>(Reseller Rate)</i>"
+            final_price = resell_price; discount_tag = ""
         else:
             base_price = reg_price
             effective_discount = max(global_disc_val, prod_disc_val)
@@ -14031,10 +14736,10 @@ def show_product_plans(chat_id, product_name, message_id=None):
                 stock_status = "Out of Stock"
             elif stock_count > 0:
                 is_real_oos = False
-                stock_status = f"{stock_count} Available (Manual)"
+                stock_status = _stock_display_label(stock_count, api_ready)
             elif api_ready:
                 is_real_oos = False
-                stock_status = "In Stock (Auto-API)"
+                stock_status = "In Stock"
             else:
                 is_real_oos = True
                 stock_status = "Out of Stock"
@@ -14378,7 +15083,7 @@ def _process_coupon_purchase(chat_id,user_id,product_id,device_id,code):
             parse_mode='HTML',
         )
         return
-    user=get_user(user_id); is_reseller=int(user[11] or 0) if user else 0
+    user=get_user(user_id); is_reseller=1  # unified reseller-only pricing
     reg=float(product[4] or 0); res=float(product[5] or reg); prod_disc=float(product[7] or 0)
     custom_price = get_custom_plan_price(user_id, product_id)
     if is_reseller and custom_price["reseller_price"] is not None:
@@ -15230,7 +15935,7 @@ def show_order_summary(chat_id, product_id, message_id=None, device_id=None, use
     global_disc_val = _num(get_setting("global_discount") or "0.0")
     user_disc_val = _num(user[12]) if user and len(user) > 12 else 0.0
     ref_disc_used = int(user[15]) if user and len(user) > 15 else 0
-    is_reseller = int(user[11]) if user and len(user) > 11 else 0
+    is_reseller = 1  # unified reseller-only pricing
     reg_price = _num(reg_price)
     resell_price = _num(resell_price, reg_price)
     prod_disc_val = _num(prod_disc_val)
@@ -15428,7 +16133,7 @@ def process_wallet_checkout(chat_id, user_id, product_id, device_id=None, messag
         global_disc_val = float(get_setting('global_discount') or '0.0')
         user_disc_val = user[12] if user and len(user) > 12 else 0.0
         ref_disc_used = user[15] if user and len(user) > 15 else 0
-        is_reseller = user[11] if user and len(user) > 11 else 0
+        is_reseller = 1  # unified reseller-only pricing
 
         custom_price = get_custom_plan_price(user_id, product_id)
         if is_reseller == 1 and custom_price["reseller_price"] is not None:
@@ -15679,6 +16384,7 @@ def show_upi_checkout(chat_id, product_id, message_id=None, device_id=None):
         is_reseller = int(user[11]) if user and len(user) > 11 else 0
     except (TypeError, ValueError):
         is_reseller = 0
+    is_reseller = 1  # unified reseller-only pricing
 
     custom_price = get_custom_plan_price(chat_id, product_id)
     if is_reseller == 1 and custom_price["reseller_price"] is not None:
@@ -18907,6 +19613,198 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 f"📦 <b>{html.escape(str(plan[1]))}</b>\n\nPlan <b>{html.escape(str(plan[3]))}</b> is now {'🔴 HIDDEN' if new_state else '🟢 VISIBLE'}.",
                 parse_mode='HTML', reply_markup=_product_visibility_markup(str(plan[1])))
 
+    elif call.data == 'adv_api_system':
+        if _is_admin(user_id):
+            _send_adv_panel(call)
+
+    elif call.data == 'adv_set_token':
+        if _is_admin(user_id):
+            admin_temp_data[user_id] = {}
+            m = _admin_ui_send(call, '🔑 <b>Enter Advance API Token:</b>', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_adv_token)
+
+    elif call.data == 'adv_edit_token':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call, '✏️ <b>Enter the new Advance API Token:</b>', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_edit_adv_token)
+
+    elif call.data == 'adv_edit_url':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call, '🌐 <b>Enter the new Advance API Server Link:</b>\n\nExample: <code>https://adminshops.com</code>', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_edit_adv_url)
+
+    elif call.data == 'adv_check':
+        if _is_admin(user_id):
+            ok, detail, _ = _adv_check_connection()
+            bot.answer_callback_query(call.id, ('Connected Successfully!' if ok else 'Not Connected') + f'\n{str(detail)[:150]}', show_alert=True)
+            _send_adv_panel(call)
+
+    elif call.data == 'adv_balance':
+        if _is_admin(user_id):
+            status, data, err = _adv_request('GET', '/balance', timeout=15)
+            if err:
+                set_setting('adv_api_connected', '0')
+                bot.answer_callback_query(call.id, f'Not Connected\n{err[:150]}', show_alert=True)
+            else:
+                set_setting('adv_api_connected', '1')
+                info = data.get('data') if isinstance(data.get('data'), dict) else {}
+                bot.answer_callback_query(call.id, '💰 ' + _adv_balance_text(info), show_alert=True)
+            _send_adv_panel(call)
+
+    elif call.data == 'adv_catalog' or call.data == 'adv_cat_refresh' or call.data.startswith('adv_cat_'):
+        if _is_admin(user_id):
+            page = 0
+            if call.data.startswith('adv_cat_') and call.data != 'adv_cat_refresh':
+                try:
+                    page = int(call.data.replace('adv_cat_', '', 1))
+                except ValueError:
+                    page = 0
+            catalog, err = _adv_get_catalog(force=(call.data in ('adv_catalog', 'adv_cat_refresh')))
+            if not catalog:
+                bot.answer_callback_query(call.id, f'Could not load products.\n{err or "Catalog is empty."}'[:190], show_alert=True)
+                return
+            groups = _adv_group_catalog(catalog)
+            markup, page, pages = _adv_catalog_markup(groups, page)
+            _admin_ui_send(call, _adv_catalog_text(groups, page, pages), parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('adv_pick_'):
+        if _is_admin(user_id):
+            catalog, err = _adv_get_catalog()
+            if not catalog:
+                bot.answer_callback_query(call.id, f'Could not load products.\n{err or "Catalog is empty."}'[:190], show_alert=True)
+                return
+            groups = _adv_group_catalog(catalog)
+            wanted = call.data.replace('adv_pick_', '', 1)
+            remote_name = next((n for n in groups if _ui_hash(n) == wanted), None)
+            if not remote_name:
+                bot.answer_callback_query(call.id, 'Product not found. Refresh the list.', show_alert=True)
+                return
+            try:
+                res = _adv_import_product(remote_name, groups[remote_name])
+            except Exception as exc:
+                print(f'[ADVANCE API] import error: {exc}')
+                bot.answer_callback_query(call.id, f'Import failed: {str(exc)[:150]}', show_alert=True)
+                return
+            bot.answer_callback_query(call.id, 'Product imported')
+            view, markup = _adv_hack_view(res['name'])
+            _admin_ui_send(call, _adv_import_text(res) + '\n\n━━━━━━━━━━━━━━━━━━━━\n' + view, parse_mode='HTML', reply_markup=markup)
+
+    elif call.data == 'adv_import_all':
+        if _is_admin(user_id):
+            catalog, err = _adv_get_catalog(force=True)
+            if not catalog:
+                bot.answer_callback_query(call.id, f'Could not load products.\n{err or "Catalog is empty."}'[:190], show_alert=True)
+                return
+            groups = _adv_group_catalog(catalog)
+            hacks_new = plans_new = plans_linked = 0
+            try:
+                for remote_name, entries in groups.items():
+                    res = _adv_import_product(remote_name, entries)
+                    hacks_new += 1 if res['created_hack'] else 0
+                    plans_new += res['created']
+                    plans_linked += res['linked']
+            except Exception as exc:
+                print(f'[ADVANCE API] import-all error: {exc}')
+                bot.answer_callback_query(call.id, f'Import failed: {str(exc)[:150]}', show_alert=True)
+                return
+            bot.answer_callback_query(call.id, f'Imported {len(groups)} products\nNew hacks: {hacks_new} · New plans: {plans_new} · Linked: {plans_linked}', show_alert=True)
+            markup, page, pages = _adv_catalog_markup(groups, 0)
+            _admin_ui_send(call, _adv_catalog_text(groups, page, pages), parse_mode='HTML', reply_markup=markup)
+
+    elif call.data == 'adv_hacks':
+        if _is_admin(user_id):
+            markup, count = _adv_hacks_markup()
+            _admin_ui_send(call,
+                '🎮 <b>ADVANCE API — CONNECT HACK</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                + ('Tap a hack to turn Advance API ON / OFF.\n🟢 = Advance API · ⚪ = previous API'
+                   if count else 'No hack is linked yet. Use <b>Select Product</b> first.'),
+                parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('adv_hack_'):
+        if _is_admin(user_id):
+            product_name = _adv_hack_by_hash(call.data.replace('adv_hack_', '', 1))
+            if not product_name:
+                return
+            view, markup = _adv_hack_view(product_name)
+            _admin_ui_send(call, view, parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('adv_toggle_'):
+        if _is_admin(user_id):
+            product_name = _adv_hack_by_hash(call.data.replace('adv_toggle_', '', 1))
+            if not product_name:
+                return
+            new_state = not _adv_hack_enabled(product_name)
+            if new_state:
+                if not _adv_api_token() or not _adv_base_url():
+                    bot.answer_callback_query(call.id, 'Set the API Token and Server Link first.', show_alert=True)
+                    return
+                if not _adv_connected():
+                    bot.answer_callback_query(call.id, 'Tap Check Connect first — the API is not connected.', show_alert=True)
+                    return
+                pm = _adv_plan_map()
+                if not any(str(r[0]) in pm for r in get_product_plans(product_name)):
+                    bot.answer_callback_query(call.id, 'No plan of this hack is linked to a server product.', show_alert=True)
+                    return
+            _adv_set_hack_enabled(product_name, new_state)
+            bot.answer_callback_query(call.id, 'Advance API ON — previous API on hold' if new_state else 'Advance API OFF — previous API restored')
+            view, markup = _adv_hack_view(product_name)
+            _admin_ui_send(call, view, parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('adv_plan_'):
+        if _is_admin(user_id):
+            parts = call.data.split('_', 3)
+            if len(parts) != 4:
+                return
+            product_name = _adv_hack_by_hash(parts[2])
+            try:
+                plan_id = int(parts[3])
+            except ValueError:
+                return
+            plan = {int(x[0]): x for x in get_product_plans(product_name or '')}.get(plan_id)
+            if not product_name or not plan:
+                return
+            admin_temp_data[user_id] = {'adv_product': product_name, 'adv_plan_id': plan_id}
+            m = _admin_ui_send(call,
+                f'🆔 <b>Server product ID for {html.escape(str(plan[2]))}</b>\n\n'
+                'Send the numeric <code>product_id</code> from the server catalog,\n'
+                'or <code>0</code> to unlink this plan (it will use the previous API).',
+                parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_adv_plan_id)
+
+    elif call.data.startswith('adv_remove_'):
+        if _is_admin(user_id):
+            product_name = _adv_hack_by_hash(call.data.replace('adv_remove_', '', 1))
+            if not product_name:
+                return
+            for row in get_product_plans(product_name):
+                _adv_set_plan_remote_id(int(row[0]), '')
+            _adv_set_hack_enabled(product_name, False)
+            bot.answer_callback_query(call.id, 'Advance link removed — previous API restored')
+            markup, count = _adv_hacks_markup()
+            _admin_ui_send(call, '🎮 <b>ADVANCE API — CONNECT HACK</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                           + ('Tap a hack to turn Advance API ON / OFF.' if count else 'No hack is linked yet. Use <b>Select Product</b> first.'),
+                           parse_mode='HTML', reply_markup=markup)
+
+    elif call.data == 'adv_delete':
+        if _is_admin(user_id):
+            m = types.InlineKeyboardMarkup(row_width=1)
+            m.add(_admin_colorful_button('✅ Yes, delete API', callback_data='adv_delete_yes', color='red'))
+            m.add(_admin_colorful_button('🔙 Cancel', callback_data='adv_api_system', color='blue'))
+            _admin_ui_send(call,
+                '🗑 <b>Delete Advance API?</b>\n\nToken and link are removed and every hack goes back to its previous API.\n'
+                '<i>Your hacks, plans and prices are not deleted.</i>',
+                parse_mode='HTML', reply_markup=_style_admin_markup(_ensure_admin_back_button(m)))
+
+    elif call.data == 'adv_delete_yes':
+        if _is_admin(user_id):
+            set_setting(ADV_API_TOKEN_KEY, '')
+            set_setting(ADV_API_URL_KEY, '')
+            set_setting('adv_api_connected', '0')
+            _adv_json_set(ADV_API_ENABLED_MAP_KEY, {})
+            _ADV_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
+            bot.answer_callback_query(call.id, 'Advance API deleted — previous APIs restored')
+            _send_adv_panel(call)
+
     elif call.data == 'banti_api_system':
         if _is_admin(user_id):
             _send_banti_panel(call)
@@ -19338,7 +20236,7 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
         if _is_admin(user_id):
             plan_id = int(call.data.replace("edit_hack_price_plan_", '', 1))
             admin_temp_data.setdefault(user_id, {})['edit_plan_id'] = plan_id
-            msg = _admin_ui_send(call, "💰 <b>Enter new price:</b>\nFormat: <code>User_Price | Reseller_Price</code>", parse_mode='HTML')
+            msg = _admin_ui_send(call, "💎 <b>Enter new Reseller Price (₹):</b>\nExample: <code>150</code>", parse_mode='HTML')
             bot.register_next_step_handler(msg, step_save_existing_hack_price)
 
     elif call.data.startswith("edit_hack_days_") and not call.data.startswith("edit_hack_days_plan_"):
@@ -19460,7 +20358,7 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
         if _is_admin(user_id):
             plan_id = int(call.data.replace("select_plan_edit_price_", ""))
             admin_temp_data[user_id] = {'plan_id': plan_id}
-            msg = _admin_ui_send(call, "💰 <b>Enter New User Price & Reseller Price in INR (₹)</b>\nFormat: <code>User_Price | Reseller_Price</code>\nExample: <code>250 | 180</code>", parse_mode="HTML")
+            msg = _admin_ui_send(call, "💎 <b>Enter New Reseller Price in INR (₹)</b>\nExample: <code>180</code>", parse_mode="HTML")
             bot.register_next_step_handler(msg, step_edit_product_price)
 
     elif call.data == "admin_view_pending_payments":
@@ -19689,7 +20587,7 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 "Then send your own text + Premium emoji(s).\n\n"
                 "Dynamic placeholders (only where you want live values):\n"
                 "<code>{days}</code> = plan days\n"
-                "<code>{stock}</code> = Auto-API / Manual / Out of Stock\n"
+                "<code>{stock}</code> = In Stock / N Stock Available / Out of Stock\n"
                 "<code>{price}</code> = live price\n\n"
                 "❌ No old PLANS & PRICING / CHOOSE A PLAN text will be added.",
                 parse_mode="HTML", reply_markup=_ensure_admin_back_button(markup)
@@ -19757,7 +20655,7 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 "The bot will automatically:\n"
                 "• remove old duplicated plan/price rows from this template;\n"
                 "• insert each hack's current Admin-configured plans/prices;\n"
-                "• show <b>In Stock (Auto-API)</b> when API stock is used;\n"
+                "• show <b>In Stock</b> when API stock is used;\n"
                 "• show manual stock automatically when manual keys exist;\n"
                 "• preserve your Premium custom emojis;\n"
                 "• keep the same template across every hack.\n\n"
@@ -20288,8 +21186,8 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 f"⚡ <b>QUICK ADMIN SETUP</b>\n\n"
                 f"Send setup details in this exact multi-line format:\n\n"
                 f"<code>Product_ID | Hack Name\n"
-                f"1 Hours | 1 Hours | User_Price | Reseller_Price\n"
-                f"1 DaYs | 1 DaYs | User_Price | Reseller_Price</code>"
+                f"1 Hours | 1 Hours | Reseller_Price\n"
+                f"1 DaYs | 1 DaYs | Reseller_Price</code>"
             )
             msg = _admin_ui_send(call, msg_text, parse_mode="HTML")
             bot.register_next_step_handler(msg, step_quick_setup)
@@ -20382,7 +21280,7 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
             plans = get_product_plans(product_name)
             lines = [f"🎮 <b>{html.escape(str(product_name))}</b>", "━━━━━━━━━━━━━━━━━━━━", f"📦 <b>{len(plans)} Plan(s)</b>", ""]
             for idx, plan in enumerate(plans, 1):
-                lines.append(f"{idx}. 📅 <b>{html.escape(str(plan[2]))}</b>  ·  User ₹{plan[3]:.2f}  ·  Reseller ₹{plan[4]:.2f}")
+                lines.append(f"{idx}. 📅 <b>{html.escape(str(plan[2]))}</b>  ·  ₹{plan[4]:.2f}")
             if not plans:
                 lines.append("<i>No plans found.</i>")
             _admin_ui_send(call, "\n".join(lines), parse_mode="HTML", reply_markup=_pp_selected_hack_screen(user_id, product_name))
@@ -20489,14 +21387,13 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
                 bot.answer_callback_query(call.id, "❌ Plan not found for this product.", show_alert=True); return
             data["pp_custom_price_plan_id"] = plan_id
             custom = get_custom_plan_price(target, plan_id)
-            cur_u = "-" if custom["user_price"] is None else f"{custom['user_price']:.2f}"
             cur_r = "-" if custom["reseller_price"] is None else f"{custom['reseller_price']:.2f}"
             msg = _admin_ui_send(call, "💰 <b>SET CUSTOM PLAN PRICE</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"🎮 <b>Product:</b> {html.escape(product_name)}\n"
                 f"📅 <b>Plan:</b> {html.escape(str(plan[3]))}\n"
                 f"👤 <b>User ID:</b> <code>{target}</code>\n\n"
-                f"Current: <code>{cur_u} | {cur_r}</code>\n\n"
-                "Send <code>User_Price | Reseller_Price</code>\nExample: <code>500 | 350</code>\nUse <code>-</code> to clear an override.", parse_mode="HTML")
+                f"Current: <code>{cur_r}</code>\n\n"
+                "Send the Reseller Price, e.g. <code>350</code>. Use <code>-</code> to clear.", parse_mode="HTML")
             bot.register_next_step_handler(msg, step_save_custom_plan_price)
 
     elif call.data.startswith("pp_key_edit_"):
