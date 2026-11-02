@@ -8071,12 +8071,14 @@ def _is_admin_ui_callback(data):
         'prod_', 'checkout_', 'open_store', 'my_account', 'orders',
         'invite_earn', 'how_to_use_bot', 'help_desk', 'out_of_stock_alert',
         'back_to_main', 'back_to_main_new', 'back_from_qr', 'reseller_qr_back',
-        'reseller_my_account', 'reseller_api_generate', 'reseller_api_catalog', 'reseller_api_reset'
+        'reseller_my_account', 'reseller_api_generate', 'reseller_api_catalog', 'reseller_api_reset',
+        'reseller_api_docs', 'reseller_api_idlist'
     )
     if data in {'open_store','my_account','orders','invite_earn','how_to_use_bot',
                 'help_desk','top_up','topup_custom','out_of_stock_alert',
                 'back_to_main','back_to_main_new','back_from_qr','reseller_qr_back',
-                'reseller_my_account','reseller_api_generate','reseller_api_catalog','reseller_api_reset'}:
+                'reseller_my_account','reseller_api_generate','reseller_api_catalog','reseller_api_reset',
+                'reseller_api_docs','reseller_api_idlist'}:
         return False
     if data.startswith(user_prefixes):
         return False
@@ -15147,6 +15149,15 @@ def _reseller_api_token(user_id):
     row=sqlite3.connect(str(BOT_DB_PATH),timeout=15).execute('SELECT api_token FROM reseller_api_credentials WHERE user_id=? AND enabled=1',(int(user_id),)).fetchone()
     return row[0] if row else None
 
+def _railway_public_url():
+    """Public domain that Railway injects automatically once a domain is generated."""
+    for _key in ('RAILWAY_PUBLIC_DOMAIN', 'RAILWAY_STATIC_URL'):
+        _val = str(os.environ.get(_key) or '').strip()
+        if _val:
+            return _val
+    return ''
+
+
 def _reseller_api_public_link():
     """Return the public HTTPS root used in reseller credentials.
 
@@ -15159,6 +15170,7 @@ def _reseller_api_public_link():
         get_setting('reseller_api_public_url'),
         os.environ.get('RESELLER_API_PUBLIC_URL'),
         os.environ.get('PUBLIC_URL'),
+        _railway_public_url(),
         os.environ.get('KOYEB_PUBLIC_DOMAIN'),
         os.environ.get('RENDER_EXTERNAL_URL'),
     ]
@@ -15183,6 +15195,7 @@ def _save_reseller_api_public_link(value):
         base_candidates = [
             os.environ.get('RESELLER_API_PUBLIC_URL'),
             os.environ.get('PUBLIC_URL'),
+            _railway_public_url(),
             os.environ.get('KOYEB_PUBLIC_DOMAIN'),
             os.environ.get('RENDER_EXTERNAL_URL'),
             RESELLER_API_PUBLIC_URL_FALLBACK,
@@ -15388,9 +15401,24 @@ def _deliver_product_key_with_fallback(product, order_ref, android_id=None):
     return None, 'none'
 
 
-def _reseller_api_catalog():
+def _reseller_api_plan_price(user_id, plan_id, resell_price, price):
+    """Exact price this reseller pays (same rule as the purchase path)."""
+    base = float(resell_price or price or 0)
+    if user_id is None:
+        return base
+    try:
+        cp = get_custom_plan_price(int(user_id), int(plan_id))
+        if cp.get('reseller_price') is not None:
+            return float(cp['reseller_price'])
+    except Exception:
+        pass
+    return base
+
+
+def _reseller_api_catalog(user_id=None):
     out=[]
     # Public reseller IDs are random/stable mappings, never SQLite row IDs.
+    # Hidden products and hidden plans are never listed.
     for name in get_visible_products():
         rows=[r for r in get_product_plans(name) if not _plan_hidden(r[0])]
         if not rows:
@@ -15406,10 +15434,277 @@ def _reseller_api_catalog():
             plans.append({
                 'validity':str(row[2]),
                 'valid_id':str(valid_id),
-                'price':float(row[5] or row[4] or 0)
+                'variant_id':str(valid_id),
+                'price':_reseller_api_plan_price(user_id,row[0],row[4],row[3]),
+                'in_stock':not bool(int(row[9] or 0)),
             })
         out.append({'name':name,'product_id':str(product_id),'plans':plans})
     return out
+
+
+def _reseller_api_orders(user_id, limit=20, order_id=None):
+    conn=sqlite3.connect(str(BOT_DB_PATH),timeout=15)
+    try:
+        sql=("SELECT order_id,product_name,plan_days,price_paid,purchased_key,"
+             "COALESCE(NULLIF(purchased_at,''),date_time),COALESCE(delivery_source,'') "
+             "FROM order_history WHERE user_id=?")
+        args=[int(user_id)]
+        if order_id:
+            sql+=' AND order_id=?'; args.append(str(order_id))
+        sql+=' ORDER BY id DESC LIMIT ?'; args.append(int(limit))
+        rows=conn.execute(sql,args).fetchall()
+    finally:
+        conn.close()
+    return [{'order_id':str(r[0]),'product':str(r[1]),'validity':str(r[2]),
+             'price':float(r[3] or 0),'key':str(r[4] or ''),'date':str(r[5] or ''),
+             'delivery_source':str(r[6] or '')} for r in rows]
+
+
+def _reseller_api_idlist_text(user_id):
+    link=_reseller_api_public_link() or 'SET-PUBLIC-API-LINK-FIRST'
+    catalog=_reseller_api_catalog(user_id)
+    L=['RESELLER PRODUCT ID & VARIANT ID LIST','='*44,
+       f'Server Link : {link}',
+       f'Generated   : {_now_ist_text()} IST',
+       'Prices shown are YOUR reseller prices (wallet currency).','']
+    for item in catalog:
+        L.append(f'PRODUCT: {item["name"]}')
+        L.append(f'  Product ID : {item["product_id"]}')
+        for p in item['plans']:
+            stock='' if p['in_stock'] else '  [OUT OF STOCK]'
+            L.append(f'  - {p["validity"]:<14} Variant ID: {p["valid_id"]:<10} Price: {p["price"]:g}{stock}')
+        L.append('')
+    if not catalog:
+        L.append('No products are available yet.')
+    L+=['','CSV (for import)','-'*44,'product_name,product_id,validity,variant_id,price,in_stock']
+    for item in catalog:
+        for p in item['plans']:
+            nm=str(item['name']).replace('"','""')
+            L.append(f'"{nm}",{item["product_id"]},"{p["validity"]}",{p["valid_id"]},{p["price"]:g},{int(p["in_stock"])}')
+    return '\n'.join(L)+'\n'
+
+
+_RESELLER_API_DOCS_TEMPLATE = """# Reseller API Documentation (v1)
+
+This document is written so that any AI coding assistant or developer can build a
+complete client (a Telegram bot, a website or an app) on top of this shop's Reseller API.
+
+- **Base URL (Server Link):** `__BASE__`
+- **Authentication:** header `Authorization: Bearer <YOUR_API_TOKEN>` on every call
+  (except `/api/v1/health` and `/api/v1/docs`)
+- **Format:** JSON, UTF-8. Send `Content-Type: application/json` on POST requests.
+- **Prices:** plain numbers in the same currency as your wallet balance.
+
+The API Token is shown in the shop bot: My Profile -> API Generate. Treat it like a password.
+
+---------------------------------------------------------------------
+
+## 1. How it works (big picture)
+
+1. Your customer pays YOU inside your own bot/website.
+2. Your client calls `POST /api/v1/purchase` with a Product ID and a Variant (Validity) ID.
+3. The shop deducts the reseller price from YOUR wallet balance held in the shop bot,
+   delivers a licence key and returns it in the response.
+4. Your client shows the key to your customer.
+
+Rules enforced by the server:
+
+1. Your wallet balance must be at least the price. If not, you get `402 INSUFFICIENT_BALANCE`
+   and nothing is charged. Top up the balance in the shop bot first.
+2. Products or plans hidden by the shop owner are NOT in the catalog and cannot be bought.
+3. The price you pay is your own reseller price (custom prices assigned to you apply).
+4. If a key cannot be delivered, your balance is refunded automatically (`502 KEY_DELIVERY_FAILED`).
+5. The token must stay on your SERVER. Never put it in front-end JavaScript, an APK, or
+   anything your customers can read.
+6. Always send an `Idempotency-Key` on purchases so a retry can never double-charge you.
+
+---------------------------------------------------------------------
+
+## 2. Endpoints
+
+### 2.1 Health (no auth)
+`GET /api/v1/health`
+```json
+{"success":true,"service":"RG Cheat Shop Reseller API","status":"online","version":"v1"}
+```
+
+### 2.2 Check balance
+`GET /api/v1/balance`
+```json
+{"success":true,"balance":1250.5,"user_id":"123456789","is_reseller":true}
+```
+
+### 2.3 Account info
+`GET /api/v1/me`
+```json
+{"success":true,"user":{"id":"123456789","name":"Reseller","is_reseller":true},"balance":1250.5}
+```
+
+### 2.4 Product catalog / sync (use this to "set products" in your own bot)
+`GET /api/v1/catalog`  (aliases: `/api/v1/products`, `/api/v1/sync`)
+
+Returns every visible product, its variants (validities) and YOUR reseller price.
+```json
+{
+  "success": true,
+  "catalog_hash": "a1b2c3d4e5f60718",
+  "generated_at": "2026-11-02 10:15:00",
+  "balance": 1250.5,
+  "catalog": [
+    {
+      "name": "Product Name",
+      "product_id": "48213",
+      "plans": [
+        {"validity":"1 Day","valid_id":"731904","variant_id":"731904","price":120.0,"in_stock":true},
+        {"validity":"7 Days","valid_id":"731905","variant_id":"731905","price":450.0,"in_stock":true}
+      ]
+    }
+  ]
+}
+```
+- `product_id` + `valid_id` (same value as `variant_id`) are what you send when buying.
+- `catalog_hash` changes whenever products, plans or prices change. Compare it with the
+  last one you stored to know when to re-import.
+- Hidden products/plans never appear. If the owner hides something, it disappears
+  from the next sync, so remove it from your own store too.
+- Recommended: sync on start-up and every 5-10 minutes. Add your own profit margin on top
+  of `price` when you display prices to your customers.
+
+### 2.5 Purchase a key
+`POST /api/v1/purchase`  (aliases: `/api/v1/buy`, `/api/v1/generate-key`)
+
+Headers: `Authorization: Bearer <TOKEN>`, `Content-Type: application/json`,
+`Idempotency-Key: <unique id per customer order>`
+
+Body:
+```json
+{"product_id":"48213","validity_id":"731905"}
+```
+(`variant_id` or `valid_id` are also accepted instead of `validity_id`.)
+
+Success (HTTP 200):
+```json
+{
+  "success": true,
+  "order_id": "RAPI202611021015301234",
+  "product_id": "48213",
+  "validity_id": "731905",
+  "delivery_source": "manual",
+  "key": "XXXX-XXXX-XXXX",
+  "price": 450.0,
+  "balance": 800.5,
+  "user": {"id":"123456789","name":"Reseller","key":"XXXX-XXXX-XXXX"}
+}
+```
+Read the key from `key` (or `user.key`). `balance` is your remaining balance.
+
+### 2.6 Orders
+- `GET /api/v1/orders?limit=20` - your latest orders (max 50)
+- `GET /api/v1/orders/<order_id>` - one order (use it to recover a key if your client crashed)
+```json
+{"success":true,"orders":[{"order_id":"RAPI...","product":"Product Name","validity":"7 Days",
+ "price":450.0,"key":"XXXX-XXXX-XXXX","date":"2026-11-02 10:15:30","delivery_source":"manual"}]}
+```
+
+### 2.7 This document (no auth)
+`GET /api/v1/docs`
+
+---------------------------------------------------------------------
+
+## 3. Errors
+
+Every error looks like `{"success":false,"error":"CODE", ...}`.
+
+| HTTP | error                       | Meaning / what to do                                              |
+|------|-----------------------------|-------------------------------------------------------------------|
+| 400  | INVALID_JSON                | Body is not valid JSON.                                           |
+| 400  | MISSING_PRODUCT_OR_VALIDITY | Send both `product_id` and `validity_id`.                         |
+| 401  | INVALID_API_KEY             | Wrong/old token, or reseller access is disabled. Re-check token.  |
+| 402  | INSUFFICIENT_BALANCE        | Response has `balance` and `required`. Top up, then retry.        |
+| 403  | RESELLER_API_DISABLED       | The shop owner turned the API off.                                |
+| 404  | INVALID_PRODUCT_OR_VALIDITY | Unknown IDs. Re-sync the catalog.                                 |
+| 404  | PRODUCT_HIDDEN              | Product/plan was hidden. Remove it from your store.               |
+| 404  | ORDER_NOT_FOUND             | No such order for your account.                                   |
+| 409  | BALANCE_CHANGED_RETRY       | Balance changed during the call. Retry with the SAME Idempotency-Key. |
+| 502  | KEY_DELIVERY_FAILED         | No key could be delivered; you were refunded (`refunded:true`).   |
+
+---------------------------------------------------------------------
+
+## 4. Client build guide (give this section to your AI)
+
+Build a client with this behaviour:
+
+1. **Config** (environment variables, never hard-coded in public code):
+   `SHOP_API_URL` = the Base URL above, `SHOP_API_TOKEN` = your token.
+2. **Sync products:** call `GET /api/v1/catalog` on start-up and periodically. Store
+   `product_id`, `valid_id`, name, validity, base `price`, `in_stock`. Build your own
+   store menu from it. Your selling price = `price` + your margin.
+3. **Before charging your customer** call `GET /api/v1/balance`. If
+   `balance < price`, tell your customer the item is temporarily unavailable (and notify yourself to top up).
+4. **After your customer has paid**, call `POST /api/v1/purchase` with a unique
+   `Idempotency-Key` (for example your own order number). Use a timeout of at least 60 seconds
+   because key delivery can take a few seconds.
+5. **On success** deliver `key` to your customer and save `order_id`.
+6. **On `502` / network timeout:** do NOT create a new order id. Retry once with the same
+   `Idempotency-Key`, or look it up with `GET /api/v1/orders/<order_id>`. If it still fails,
+   refund your own customer.
+7. **On `404` (hidden/unknown):** re-sync the catalog and hide the item in your store.
+8. Never log or display the API token. Keep it only on the server.
+
+### Python reference client
+```python
+import os, uuid, requests
+
+BASE = os.environ["SHOP_API_URL"].rstrip("/")
+H = {"Authorization": "Bearer " + os.environ["SHOP_API_TOKEN"]}
+
+def balance():
+    return requests.get(BASE + "/api/v1/balance", headers=H, timeout=20).json()["balance"]
+
+def catalog():
+    return requests.get(BASE + "/api/v1/catalog", headers=H, timeout=30).json()["catalog"]
+
+def buy(product_id, validity_id, order_ref=None):
+    headers = dict(H, **{"Idempotency-Key": order_ref or str(uuid.uuid4())})
+    r = requests.post(BASE + "/api/v1/purchase", headers=headers, timeout=90,
+                      json={"product_id": product_id, "validity_id": validity_id})
+    data = r.json()
+    if not data.get("success"):
+        raise RuntimeError(data.get("error", "UNKNOWN"))
+    return data["key"], data["order_id"], data["balance"]
+```
+
+### curl examples
+```bash
+curl -H "Authorization: Bearer $TOKEN" __BASE__/api/v1/balance
+curl -H "Authorization: Bearer $TOKEN" __BASE__/api/v1/catalog
+curl -X POST __BASE__/api/v1/purchase \\
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -H "Idempotency-Key: ORDER-1001" \\
+  -d '{"product_id":"48213","validity_id":"731905"}'
+```
+
+### Node.js (fetch) example
+```js
+const BASE = process.env.SHOP_API_URL, TOKEN = process.env.SHOP_API_TOKEN;
+const api = (path, opt = {}) => fetch(BASE + path, {
+  ...opt, headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json", ...(opt.headers || {}) }
+}).then(r => r.json());
+
+const bal = await api("/api/v1/balance");
+const cat = await api("/api/v1/catalog");
+const buy = await api("/api/v1/purchase", {
+  method: "POST", headers: { "Idempotency-Key": "ORDER-1001" },
+  body: JSON.stringify({ product_id: "48213", validity_id: "731905" })
+});
+```
+"""
+
+
+def _reseller_api_docs_text(base_url=''):
+    base = str(base_url or '').strip().rstrip('/') or 'https://YOUR-SERVER-LINK'
+    return _RESELLER_API_DOCS_TEMPLATE.replace('__BASE__', base)
+
 
 def _reseller_api_find_plan(product_id,validity_id):
     # Preferred path: random public Product ID + random Validity ID mapping.
@@ -15468,6 +15763,42 @@ def _reseller_api_find_credentials(token):
                WHERE c.api_token=? AND c.enabled=1 AND u.is_reseller=1 AND COALESCE(u.is_banned,0)=0""",(token,)
         ).fetchone()
     finally: conn.close()
+
+
+def _reseller_api_token_problem(token):
+    """Explain why a token was refused, so the reseller can fix it.
+
+    Details are revealed only when the token itself exists in this bot's
+    database; an unknown token always gets the generic INVALID_API_KEY.
+    """
+    token = str(token or '').strip()
+    if not token:
+        return 401, 'MISSING_API_KEY', 'No token received. Send the header: Authorization: Bearer <token>'
+    if not _reseller_api_feature_enabled():
+        return 403, 'RESELLER_API_DISABLED', 'The Reseller API is turned off in this bot.'
+    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
+    try:
+        row = conn.execute(
+            """SELECT c.enabled, u.user_id, u.is_reseller, COALESCE(u.is_banned,0)
+               FROM reseller_api_credentials c LEFT JOIN users u ON u.user_id=c.user_id
+               WHERE c.api_token=?""", (token,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return 401, 'INVALID_API_KEY', ('This token does not exist on this server. Generate it in THIS bot '
+                                         '(My Profile -> API Generate) and copy the full token. '
+                                         'A reset token invalidates the old one.')
+    enabled, uid, is_reseller, banned = row
+    if not int(enabled or 0):
+        return 401, 'TOKEN_DISABLED', 'This token was disabled. Generate a new one.'
+    if uid is None:
+        return 401, 'USER_NOT_FOUND', 'The account owning this token no longer exists.'
+    if not int(is_reseller or 0):
+        return 403, 'NOT_A_RESELLER', 'This account is not an active reseller. Ask the owner to enable reseller access.'
+    if int(banned or 0):
+        return 403, 'ACCOUNT_BANNED', 'This account is banned.'
+    return 401, 'INVALID_API_KEY', 'Token rejected.'
 
 
 def _reseller_api_idempotent_response(key, user_id):
@@ -15667,6 +15998,7 @@ def _reseller_api_purchase_for_user(user_id, product_id, validity_id, idem=''):
         'product_id': str(product_id),
         'validity_id': str(validity_id),
         'delivery_source': delivery_source,
+        'key': key,
         'user': {
             'id': str(user_id),
             'telegram_id': str(user_id),
@@ -15707,6 +16039,27 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    def _send_text(self, code, text, ctype='text/plain; charset=utf-8'):
+        raw = str(text).encode('utf-8')
+        self.send_response(int(code))
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Cache-Control', 'no-store')
+        _reseller_api_cors_headers(self)
+        self.end_headers()
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _public_base(self):
+        link = _reseller_api_public_link()
+        if link:
+            return link
+        host = str(self.headers.get('X-Forwarded-Host') or self.headers.get('Host') or '').strip()
+        proto = str(self.headers.get('X-Forwarded-Proto') or 'https').split(',')[0].strip() or 'https'
+        return f'{proto}://{host}' if host else 'https://YOUR-SERVER-LINK'
+
     def _auth(self):
         h = str(self.headers.get('Authorization') or '')
         return h[7:].strip() if h.lower().startswith('bearer ') else ''
@@ -15715,7 +16068,11 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
         token = self._auth()
         row = _reseller_api_find_credentials(token)
         if not row:
-            self._send_json(401, {'success': False, 'error': 'INVALID_API_KEY'})
+            try:
+                code, err, msg = _reseller_api_token_problem(token)
+            except Exception:
+                code, err, msg = 401, 'INVALID_API_KEY', ''
+            self._send_json(code, {'success': False, 'error': err, 'message': msg})
             return None
         return token, row
 
@@ -15752,6 +16109,7 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
                 'service': 'RG Cheat Shop Reseller API',
                 'status': 'online',
                 'version': 'v1',
+                'docs': '/api/v1/docs',
             })
             return
 
@@ -15762,14 +16120,18 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {'success': True, 'catalog': _reseller_api_catalog()})
             return
 
-        if path in ('/api/v1/catalog', '/api/v1/products'):
+        if path in ('/api/v1/catalog', '/api/v1/products', '/api/v1/sync', '/api/v1/products/sync'):
             auth = self._require_auth()
             if not auth:
                 return
             _, row = auth
+            catalog = _reseller_api_catalog(int(row[0]))
+            digest = hashlib.sha256(json.dumps(catalog, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:16]
             self._send_json(200, {
                 'success': True,
-                'catalog': _reseller_api_catalog(),
+                'catalog': catalog,
+                'catalog_hash': digest,
+                'generated_at': _now_ist_text(),
                 'balance': float(row[1] or 0),
             })
             return
@@ -15807,6 +16169,36 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
                 },
                 'balance': float(row[1] or 0),
             })
+            return
+
+        if path in ('/api/v1/docs', '/api/v1/docs.md', '/api/docs', '/docs'):
+            self._send_text(200, _reseller_api_docs_text(self._public_base()), 'text/markdown; charset=utf-8')
+            return
+
+        if path in ('/api/v1/orders', '/api/orders'):
+            auth = self._require_auth()
+            if not auth:
+                return
+            _, row = auth
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                limit = max(1, min(50, int((qs.get('limit') or ['20'])[0])))
+            except Exception:
+                limit = 20
+            self._send_json(200, {'success': True, 'orders': _reseller_api_orders(int(row[0]), limit=limit)})
+            return
+
+        if path.startswith('/api/v1/orders/'):
+            auth = self._require_auth()
+            if not auth:
+                return
+            _, row = auth
+            oid = urllib.parse.unquote(path[len('/api/v1/orders/'):]).strip()
+            found = _reseller_api_orders(int(row[0]), order_id=oid) if oid else []
+            if not found:
+                self._send_json(404, {'success': False, 'error': 'ORDER_NOT_FOUND'})
+                return
+            self._send_json(200, {'success': True, 'order': found[0]})
             return
 
         self._send_json(404, {'success': False, 'error': 'NOT_FOUND'})
@@ -17757,6 +18149,14 @@ def _reseller_my_account_markup():
         button_key='reseller:my_account:catalog', default_color='blue', force_style=True
     ))
     markup.add(make_ui_button(
+        '📥 Download Product ID List', callback_data='reseller_api_idlist',
+        button_key='reseller:my_account:idlist', default_color='blue', force_style=True
+    ))
+    markup.add(make_ui_button(
+        '📘 API Docs', callback_data='reseller_api_docs',
+        button_key='reseller:my_account:api_docs', default_color='green', force_style=True
+    ))
+    markup.add(make_ui_button(
         '♻️ API Reset', callback_data='reseller_api_reset',
         button_key='reseller:my_account:api_reset', default_color='red', force_style=True
     ))
@@ -17891,6 +18291,37 @@ def show_reseller_api_catalog(chat_id, user_id, message_id=None, page=0):
     )
 
 
+def send_reseller_api_idlist(chat_id, user_id):
+    """Send the reseller a downloadable Product ID / Variant ID list (.txt)."""
+    if not _reseller_account_is_active(user_id):
+        show_reseller_my_account(chat_id, user_id)
+        return
+    data = io.BytesIO(_reseller_api_idlist_text(user_id).encode('utf-8'))
+    data.name = f"product_id_list_{_now_ist_text('%Y%m%d_%H%M')}.txt"
+    bot.send_document(
+        chat_id, data,
+        caption='📥 <b>PRODUCT ID & VARIANT ID LIST</b>\n\nAll visible products, variants and your reseller prices. Hidden items are not included.',
+        parse_mode='HTML'
+    )
+
+
+def send_reseller_api_docs(chat_id, user_id):
+    """Send the full API documentation file (.md) prefilled with the server link."""
+    if not _reseller_account_is_active(user_id):
+        show_reseller_my_account(chat_id, user_id)
+        return
+    link = _reseller_api_public_link()
+    data = io.BytesIO(_reseller_api_docs_text(link).encode('utf-8'))
+    data.name = 'RESELLER_API_DOCS.md'
+    note = '' if link else '\n\n⚠️ Server Link is not configured yet. Ask the owner to set it.'
+    bot.send_document(
+        chat_id, data,
+        caption=('📘 <b>API DOCS</b>\n\nGive this file to any AI coder to build your bot/website client. '
+                 'Share your API Token with the AI separately and keep it secret.' + note),
+        parse_mode='HTML'
+    )
+
+
 def show_my_account(chat_id, user_id, first_name, message_id=None):
     user = get_user(user_id)
     if user:
@@ -18005,6 +18436,14 @@ def show_my_account(chat_id, user_id, first_name, message_id=None):
         markup.add(make_ui_button(
             '🆔 Product ID & Variant ID', callback_data='reseller_api_catalog',
             button_key='reseller:my_account:catalog', default_color='blue', force_style=True
+        ))
+        markup.add(make_ui_button(
+            '📥 Download Product ID List', callback_data='reseller_api_idlist',
+            button_key='reseller:my_account:idlist', default_color='blue', force_style=True
+        ))
+        markup.add(make_ui_button(
+            '📘 API Docs', callback_data='reseller_api_docs',
+            button_key='reseller:my_account:api_docs', default_color='green', force_style=True
         ))
         markup.add(make_ui_button(
             '♻️ API Reset', callback_data='reseller_api_reset',
@@ -18276,6 +18715,14 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
         except Exception:
             page = 0
         show_reseller_api_catalog(call.message.chat.id, user_id, message_id=call.message.message_id, page=page)
+
+    elif call.data == "reseller_api_idlist":
+        _fast_callback_ack(call)
+        send_reseller_api_idlist(call.message.chat.id, user_id)
+
+    elif call.data == "reseller_api_docs":
+        _fast_callback_ack(call)
+        send_reseller_api_docs(call.message.chat.id, user_id)
 
     elif call.data == "reseller_api_reset":
         _fast_callback_ack(call)
