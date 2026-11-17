@@ -192,12 +192,15 @@ ADMIN_IDS = _env_list_of_ints('BOT_ADMIN_IDS')
 # protected from removal, while admins added later remain removable.
 _HARDCODED_ROOT_ADMIN_IDS = frozenset(ADMIN_IDS)
 
-# --- FAMGATEWAY API CONFIGURATION ---
-FAM_API_KEY = os.getenv('FAMPAY_API_KEY', '').strip()
-# Official FamGateway endpoint. FAMPAY_GATEWAY_URL can still override this for
-# an explicitly configured compatible/legacy gateway.
-BASE_GATEWAY_URL = os.getenv('FAMPAY_GATEWAY_URL', 'https://fampaygateway.site').strip()
-RECEIVER_UPI = os.getenv('FAMPAY_UPI_ID', '').strip()
+# --- PAYMENT GATEWAY (single unified API: FamPay + Paytm) ---
+# The base URL can be changed live from Admin Panel > Payment Gateway > Gateway URL.
+# PAYMENT_GATEWAY_URL is only the first-run default.
+PG_DEFAULT_BASE_URL = os.getenv('PAYMENT_GATEWAY_URL', 'https://paymentgateway-0km8.onrender.com').strip()
+PG_BASE_URL_KEY = 'pg_base_url'
+PG_API_NAMES = {'fam': 'fampay', 'paytm': 'paytm'}      # internal key -> API "gateway" value
+PG_LABELS = {'fam': 'FamPay', 'paytm': 'Paytm'}
+PG_MIN_POLL_GAP = 4.0    # API limit is 60 requests/min per key
+
 
 
 # --- SAFE TELEGRAM LONG MESSAGE SENDER (ADDED PATCH) ---
@@ -1097,13 +1100,6 @@ except Exception:
 # Dynamic Guide Link Variable
 guide_video_url = None
 
-# ==================== OPTIONAL PAYTM GATEWAY ====================
-PAYTM_PRODUCTION_BASE='https://secure.paytmpayments.com'
-PAYTM_QR_CREATE_URL=PAYTM_PRODUCTION_BASE+'/paymentservices/qr/create'
-PAYTM_STATUS_URL=PAYTM_PRODUCTION_BASE+'/v3/order/status'
-PAYTM_DEFAULT_CLIENT_ID=os.getenv('PAYTM_CLIENT_ID','C11')
-PAYTM_DEFAULT_POS_ID=os.getenv('PAYTM_POS_ID','')
-
 # ==================== DATABASE SETUP ====================
 def init_db():
     conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
@@ -1227,13 +1223,16 @@ def init_db():
             cursor.execute('INSERT OR IGNORE INTO bot_admins(user_id,added_at) VALUES(?,?)',(int(_aid),datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     except Exception: pass
     cursor.execute("CREATE TABLE IF NOT EXISTS payment_gateways (gateway TEXT PRIMARY KEY, upi_id TEXT NOT NULL DEFAULT '', merchant_id TEXT NOT NULL DEFAULT '', merchant_key TEXT NOT NULL DEFAULT '', connected INTEGER NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '')")
-    cursor.execute('INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,1,?)',('fam',RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY,datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    cursor.execute("UPDATE payment_gateways SET upi_id=?,merchant_id=?,merchant_key=? WHERE gateway='fam' AND (upi_id='' OR merchant_id='')",(RECEIVER_UPI,FAM_API_KEY,FAM_API_KEY))
+    cursor.execute('INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)',('fam','','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(PG_BASE_URL_KEY,PG_DEFAULT_BASE_URL))
+    # One-time migration: old FamPay/ZyvoPay tokens do not work with the new gateway.
+    if not cursor.execute("SELECT 1 FROM settings WHERE key='pg_migrated_v1'").fetchone():
+        cursor.execute("UPDATE payment_gateways SET upi_id='',merchant_id='',merchant_key='',connected=0")
+        cursor.execute("UPDATE settings SET value='' WHERE key='active_payment_gateway'")
+        cursor.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('pg_migrated_v1','1')")
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('active_payment_gateway','')")
     cursor.execute("UPDATE settings SET value='' WHERE key='active_payment_gateway' AND value='zyvo'")
     cursor.execute("INSERT OR IGNORE INTO payment_gateways(gateway,upi_id,merchant_id,merchant_key,connected,updated_at) VALUES(?,?,?,?,0,?)",('paytm','','','',datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_pos_id','')")
-    cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('paytm_client_id',?)",(PAYTM_DEFAULT_CLIENT_ID,))
     # Admin-controlled runtime settings. Defaults preserve the bot's current behavior.
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('bot_enabled','1')")
     cursor.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('telegram_support_id',?)",(TELEGRAM_USER,))
@@ -1917,41 +1916,44 @@ def _set_gateway_connected(gateway,ok):
 
 def _get_active_payment_gateway(): return (get_setting('active_payment_gateway') or '').strip().lower()
 
+def _pg_token(gateway):
+    row = _gateway_row(gateway)
+    return str((row[3] if row and row[3] else (row[2] if row else '')) or '').strip()
+
 def _set_active_payment_gateway(gateway):
-    gateway=str(gateway or '').lower().strip()
+    gateway = str(gateway or '').lower().strip()
     if not gateway:
-        set_setting('active_payment_gateway',''); return True
-    if gateway not in {'fam','paytm'}: return False
-    row=_gateway_row(gateway)
-    if not row or not row[1] or not row[2] or not int(row[4] or 0): return False
-    set_setting('active_payment_gateway',gateway); return True
+        set_setting('active_payment_gateway', ''); return True
+    if gateway not in PG_API_NAMES: return False
+    if not _pg_token(gateway): return False
+    set_setting('active_payment_gateway', gateway); return True
 
 def _gateway_status_line(gateway):
-    row=_gateway_row(str(gateway).lower())
-    if not row or not (row[1] and row[2]):
+    row = _gateway_row(str(gateway).lower())
+    if not row or not _pg_token(gateway):
         return 'NOT CONFIGURED'
     return 'CONNECTED' if int(row[4] or 0) else 'NOT CONNECTED'
 
-
-
-def _fam_base_url():
-    raw = str(BASE_GATEWAY_URL or '').strip().rstrip('/') or 'https://fampaygateway.site'
-    if raw.lower().endswith('/api'):
-        raw = raw[:-4].rstrip('/')
-    parsed = urllib.parse.urlparse(raw)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
-        raise RuntimeError('Invalid FamPay gateway URL.')
+def _pg_normalize_base_url(value):
+    raw = str(value or '').strip().rstrip('/')
+    if not raw:
+        return None
+    if '://' not in raw:
+        raw = 'https://' + raw
+    p = urllib.parse.urlparse(raw)
+    if p.scheme != 'https' or not p.hostname or p.username or p.password or p.query or p.fragment:
+        return None
     return raw
 
-def _fam_credentials():
-    row = _gateway_row('fam')
-    key = str((row[2] if row and row[2] else (row[3] if row and row[3] else FAM_API_KEY)) or '').strip()
-    upi = str((row[1] if row and row[1] else RECEIVER_UPI) or '').strip()
-    return upi, key
+def _pg_base_url():
+    raw = _pg_normalize_base_url(get_setting(PG_BASE_URL_KEY) or PG_DEFAULT_BASE_URL)
+    if not raw:
+        raise RuntimeError('Invalid payment gateway URL. Fix it in Admin Panel > Payment Gateway > Gateway URL.')
+    return raw
 
-def _fam_message(data):
+def _pg_message(data):
     if isinstance(data, dict):
-        for k in ('message', 'error', 'msg', 'detail'):
+        for k in ('error', 'message', 'msg', 'detail'):
             v = data.get(k)
             if isinstance(v, str) and v.strip():
                 return re.sub(r'[^\x20-\x7E]', ' ', v.strip())[:200]
@@ -1964,134 +1966,24 @@ def _fam_amount_equals(value, expected):
     except (InvalidOperation, TypeError, ValueError):
         return False
 
-def _fam_get(name, params, timeout=10):
-    """GET https://<gateway>/api/<name>. Returns (http_status, json_dict, error)."""
+def _pg_request(method, path, token, json_body=None, params=None, timeout=15):
+    """Returns (http_status, json_dict, error_text). Key is sent in a header only."""
     try:
-        url = f"{_fam_base_url()}/api/{name}"
-        res = HTTP_SESSION.get(url, params=params, timeout=timeout, allow_redirects=False)
+        url = _pg_base_url() + path
     except RuntimeError as exc:
         return None, {}, str(exc)
-    except requests.RequestException as exc:
-        # Only the exception type is logged: the message could contain the API token.
-        print(f'[FAMPAY] {name} network error: {type(exc).__name__}')
-        return None, {}, 'FamPay gateway is not reachable. Please try again.'
-    try:
-        data = res.json()
-    except Exception:
-        data = {}
-    return res.status_code, (data if isinstance(data, dict) else {}), None
-
-def _check_fam_connection():
-    upi, key = _fam_credentials()
-    if not upi or not key:
-        _set_gateway_connected('fam', False)
-        return False, 'FamPay UPI ID and API token are required.'
-    # Verifying a deliberately non-existent order proves the token is accepted
-    # without creating a real payment order.
-    dummy = 'CONNECTION_TEST_' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '_' + secrets.token_hex(3)
-    status, data, err = _fam_get('verify.php', {'order_id': dummy, 'api_key': key}, timeout=10)
-    if err:
-        _set_gateway_connected('fam', False)
-        return False, err
-    msg = _fam_message(data)
-    st = str(data.get('status') or '').lower()
-    text = (msg + ' ' + st).lower()
-    if status in (401, 403):
-        _set_gateway_connected('fam', False)
-        return False, msg or 'FamPay rejected the API token.'
-    if status is not None and status >= 500:
-        _set_gateway_connected('fam', False)
-        return False, 'FamPay gateway is temporarily unavailable.'
-    order_unknown = (st in {'not_found', 'pending', 'expired'}
-                     or any(x in text for x in ('not found', 'not_found', 'does not exist', 'no such order')))
-    if not order_unknown and any(x in text for x in ('invalid api', 'api key', 'api_key', 'unauthor', 'forbidden', 'invalid key', 'invalid token')):
-        _set_gateway_connected('fam', False)
-        return False, msg or 'FamPay rejected the API token.'
-    if not data:
-        _set_gateway_connected('fam', False)
-        return False, f'FamPay did not return a valid response (HTTP {status}). Check the gateway URL.'
-    _set_gateway_connected('fam', True)
-    return True, 'FamPay API token verified successfully.'
-
-
-# ==================== PAYTM GATEWAY (ZyvoPay API) ====================
-# Admin only supplies: UPI ID + API token (public.secret). Requests are signed
-# with HMAC-SHA256 over  timestamp + "." + rawBody  using the secret part.
-# The QR picture is always drawn by the bot's own style (_build_stylish_qr_image)
-# from the exact payment_uri returned by the gateway, so the design never changes.
-ZYVO_BASE_URL = os.getenv('ZYVOPAY_BASE_URL', 'https://zyvopay.site/api').strip().rstrip('/')
-
-def _paytm_config():
-    row = _gateway_row('paytm')
-    token = str((row[3] if row and row[3] else (row[2] if row and row[2] else '')) or '').strip()
-    return {
-        'upi_id': str(row[1]).strip() if row and row[1] else '',
-        'token': token,
-        'connected': bool(int(row[4] or 0)) if row else False,
-    }
-
-def _paytm_payment_config_error():
-    cfg = _paytm_config()
-    if not cfg['upi_id']:
-        return 'PayTM UPI ID is not set.'
-    if '.' not in cfg['token']:
-        return 'PayTM API token is missing or invalid (it must look like public.secret).'
-    return ''
-
-def _zyvo_base():
-    parsed = urllib.parse.urlparse(ZYVO_BASE_URL)
-    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
-        raise RuntimeError('Invalid PayTM gateway URL.')
-    return ZYVO_BASE_URL
-
-def _zyvo_message(data):
-    if isinstance(data, dict):
-        for k in ('message', 'error', 'msg', 'detail'):
-            v = data.get(k)
-            if isinstance(v, dict):
-                v = v.get('message') or v.get('detail')
-            if isinstance(v, str) and v.strip():
-                return re.sub(r'[^\x20-\x7E]', ' ', v.strip())[:200]
-    return ''
-
-def _zyvo_data(data):
-    """Responses may be flat or wrapped in {"data": {...}}; return one flat dict."""
-    if not isinstance(data, dict):
-        return {}
-    inner = data.get('data')
-    if isinstance(inner, dict):
-        merged = dict(data); merged.pop('data', None); merged.update(inner)
-        return merged
-    return data
-
-def _zyvo_request(name, payload=None, token=None, timeout=15, method='POST'):
-    """Signed request. Returns (http_status, json_dict, error_text)."""
-    token = str(token or _paytm_config()['token'] or '').strip()
-    if '.' not in token:
-        return None, {}, 'PayTM API token is invalid (must look like public.secret).'
-    secret = token.split('.', 1)[1]
-    try:
-        url = f'{_zyvo_base()}/{name}'
-    except RuntimeError as exc:
-        return None, {}, str(exc)
-    raw = b'' if payload is None else json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
-    ts = str(int(time.time()))
-    sig = hmac.new(secret.encode('utf-8'), ts.encode('ascii') + b'.' + raw, hashlib.sha256).hexdigest()
-    headers = {'X-API-Key': token, 'X-Timestamp': ts, 'X-Signature': sig, 'Accept': 'application/json'}
-    if method == 'POST':
-        headers['Content-Type'] = 'application/json'
-    last_err = 'PayTM gateway is not reachable. Please try again.'
+    headers = {'X-API-Key': token, 'Accept': 'application/json'}
+    last_err = 'Payment gateway is not reachable. Please try again.'
     for attempt in range(2):
         try:
             if method == 'POST':
-                res = HTTP_SESSION.post(url, data=raw, headers=headers, timeout=timeout, allow_redirects=False)
+                res = HTTP_SESSION.post(url, json=json_body, headers=headers, timeout=timeout, allow_redirects=False)
             else:
-                res = HTTP_SESSION.get(url, headers=headers, timeout=timeout, allow_redirects=False)
+                res = HTTP_SESSION.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=False)
         except requests.RequestException as exc:
-            # Never log the message: it could contain the token.
-            print(f'[PAYTM] {name} network error: {type(exc).__name__}')
+            print(f'[PAYGW] {path} network error: {type(exc).__name__}')   # never log the message (may hold the key)
             time.sleep(1); continue
-        if res.status_code >= 500 and attempt == 0:
+        if res.status_code in (502, 503, 504) and attempt == 0:
             time.sleep(1); continue
         try:
             data = res.json()
@@ -2100,145 +1992,147 @@ def _zyvo_request(name, payload=None, token=None, timeout=15, method='POST'):
         return res.status_code, (data if isinstance(data, dict) else {}), None
     return None, {}, last_err
 
-def _zyvo_orders_table():
+def _pg_orders_table():
     with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS paytm_gateway_orders (order_id TEXT PRIMARY KEY, reference TEXT NOT NULL DEFAULT '', amount REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE TABLE IF NOT EXISTS pg_orders (order_id TEXT PRIMARY KEY, gateway TEXT NOT NULL DEFAULT '', pay_id TEXT NOT NULL DEFAULT '', amount_requested REAL NOT NULL DEFAULT 0, amount_pay REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '')")
         conn.commit()
 
-def _zyvo_save_order(order_id, reference, amount):
+def _pg_save_order(order_id, gateway, pay_id, amount_requested, amount_pay):
     try:
-        _zyvo_orders_table()
+        _pg_orders_table()
         with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-            conn.execute('INSERT OR REPLACE INTO paytm_gateway_orders(order_id,reference,amount,created_at) VALUES(?,?,?,?)',
-                         (str(order_id), str(reference or ''), float(amount), datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.execute('INSERT OR REPLACE INTO pg_orders(order_id,gateway,pay_id,amount_requested,amount_pay,created_at) VALUES(?,?,?,?,?,?)',
+                         (str(order_id), str(gateway), str(pay_id or ''), float(amount_requested), float(amount_pay), datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
             conn.commit()
     except Exception as exc:
-        print(f'[PAYTM] could not store order {order_id}: {type(exc).__name__}')
+        print(f'[PAYGW] could not store order {order_id}: {type(exc).__name__}')
 
-def _zyvo_load_order(order_id):
+def _pg_load_order(order_id):
     try:
-        _zyvo_orders_table()
+        _pg_orders_table()
         with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-            return conn.execute('SELECT reference,amount FROM paytm_gateway_orders WHERE order_id=?', (str(order_id),)).fetchone()
+            return conn.execute('SELECT gateway,pay_id,amount_requested,amount_pay FROM pg_orders WHERE order_id=?', (str(order_id),)).fetchone()
     except Exception:
         return None
 
-def _check_paytm_connection():
-    """Real token => 'Connect Successful'. Anything else => 'Not Connected'.
-    Uses a signed read-only GET (no payment is created)."""
-    cfg = _paytm_config()
-    if not cfg['upi_id'] or not cfg['token']:
-        _set_gateway_connected('paytm', False)
-        return False, 'PayTM UPI ID and API token are required.'
-    if '.' not in cfg['token']:
-        _set_gateway_connected('paytm', False)
-        return False, 'This is not a valid PayTM API token (it must look like public.secret).'
-    status, data, err = _zyvo_request('payment-links.php', None, cfg['token'], timeout=12, method='GET')
-    if err:
-        _set_gateway_connected('paytm', False)
-        return False, err
-    msg = _zyvo_message(data)
-    if status is not None and 200 <= status < 300:
-        _set_gateway_connected('paytm', True)
-        return True, 'PayTM API token verified successfully.'
-    _set_gateway_connected('paytm', False)
-    if status in (401, 403):
-        return False, msg or 'PayTM rejected the API token.'
-    if status is not None and status >= 500:
-        return False, 'PayTM gateway is temporarily unavailable.'
-    return False, (msg or 'PayTM did not accept the connection') + f' (HTTP {status}).'
+def _pg_exact_amount(order_id, fallback):
+    """Amount the customer must really pay (FamPay may add paise)."""
+    row = _pg_load_order(order_id)
+    try:
+        return float(row[3]) if row else float(fallback)
+    except Exception:
+        return float(fallback)
 
-def _create_paytm_dynamic_qr(amount):
-    """Create a PayTM order and return (bot-styled QR image, order_id)."""
+def _check_pg_connection(gateway):
+    """Token only. Looks up a non-existent order: 401 = bad token, 404 JSON = token OK."""
+    gateway = str(gateway).lower()
+    token = _pg_token(gateway)
+    label = PG_LABELS.get(gateway, gateway)
+    if not token:
+        _set_gateway_connected(gateway, False)
+        return False, f'{label} API token is required.'
+    dummy = 'CONNECTION_TEST_' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '_' + secrets.token_hex(3)
+    status, data, err = _pg_request('GET', '/api/v1/payment/status/' + dummy, token, timeout=12)
+    if err:
+        _set_gateway_connected(gateway, False); return False, err
+    msg = _pg_message(data)
+    if status == 401:
+        _set_gateway_connected(gateway, False); return False, msg or 'API token is invalid.'
+    if status == 403:
+        _set_gateway_connected(gateway, False); return False, msg or 'Token blocked: plan does not include this gateway, or account is suspended.'
+    if status == 429:
+        _set_gateway_connected(gateway, False); return False, 'Rate limit reached. Try again in a minute.'
+    if status is not None and status >= 500:
+        _set_gateway_connected(gateway, False); return False, 'Payment gateway is temporarily unavailable.'
+    if status in (200, 404) and data:
+        _set_gateway_connected(gateway, True)
+        return True, f'{label} connected successfully.'
+    _set_gateway_connected(gateway, False)
+    return False, f'Unexpected reply (HTTP {status}). Check the Gateway URL.'
+
+def _create_pg_qr(amount):
+    """Create a payment on the active gateway. Returns (bot-styled QR image, order_id)."""
     amount = round(float(amount), 2)
     if not amount > 0:
         raise RuntimeError('Invalid UPI amount.')
-    cfg = _paytm_config()
-    err = _paytm_payment_config_error()
-    if err:
-        raise RuntimeError(err)
-    order_id = 'PTM' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(1000, 9999))
-    body = {'order_id': order_id, 'amount': amount, 'currency': 'INR'}
-    status, data, e = _zyvo_request('create-payment.php', body, cfg['token'], timeout=15)
+    gw = _get_active_payment_gateway()
+    if gw not in PG_API_NAMES:
+        raise RuntimeError('No payment gateway is ON. Open Admin Panel > Payment Gateway, connect a gateway and turn it ON.')
+    token = _pg_token(gw)
+    if not token:
+        raise RuntimeError(f'{PG_LABELS[gw]} API token is not configured.')
+    order_id = 'BOT' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(1000, 9999))
+    body = {'amount': int(amount) if amount == int(amount) else amount, 'order_id': order_id, 'gateway': PG_API_NAMES[gw]}
+    status, data, e = _pg_request('POST', '/api/v1/payment/create', token, json_body=body, timeout=20)
     if e:
         raise RuntimeError(e)
-    msg = _zyvo_message(data)
-    if status in (401, 403):
-        raise RuntimeError('PayTM rejected the API token. Re-enter it in the PayTM Gateway settings.')
-    if status is None or status >= 400:
-        print(f'[PAYTM] create-payment rejected (HTTP {status}): {msg}')
-        raise RuntimeError('PayTM: ' + (msg or f'could not create the payment order (HTTP {status}).'))
-    d = _zyvo_data(data)
-    reference = str(d.get('reference') or d.get('payment_reference') or '').strip()
-    if d.get('amount') not in (None, '') and not _fam_amount_equals(d.get('amount'), amount):
-        raise RuntimeError('PayTM returned a different amount for this order.')
-    _zyvo_save_order(order_id, reference, amount)
-    uri = str(d.get('payment_uri') or '').strip()
+    msg = _pg_message(data)
+    if status == 401:
+        raise RuntimeError('API token rejected. Re-enter it in Payment Gateway settings.')
+    if status is None or status >= 400 or not data.get('success'):
+        print(f'[PAYGW] create rejected (HTTP {status}): {msg}')
+        raise RuntimeError(f'{PG_LABELS[gw]}: ' + (msg or f'could not create the payment (HTTP {status}).'))
+    pay_amount = data.get('amount', amount)
+    try:
+        diff = float(pay_amount) - amount
+    except (TypeError, ValueError):
+        raise RuntimeError('Gateway returned an invalid amount.')
+    # Paytm must match exactly; FamPay may add +0.00..+0.99 paise.
+    if diff < -0.001 or diff > (0.995 if gw == 'fam' else 0.001):
+        raise RuntimeError('Gateway returned a different amount for this order.')
+    _pg_save_order(order_id, gw, data.get('pay_id'), amount, pay_amount)
+    uri = str(data.get('upi_uri') or '').strip()
     if uri.lower().startswith('upi://'):
         try:
-            return _build_stylish_qr_image(uri), order_id   # bot's own QR style, exact gateway URI
+            return _build_stylish_qr_image(uri), order_id     # bot's own QR style
         except Exception as style_error:
-            print(f'[PAYTM] styled QR failed: {style_error}')
-    qr_img = str(d.get('qr_image_url') or '').strip()
-    if qr_img.startswith('https://'):
-        return qr_img, order_id
-    raise RuntimeError('PayTM created the order but did not return a usable QR.')
+            print(f'[PAYGW] styled QR failed: {style_error}')
+    qr_png = str(data.get('qr_png_url') or '').strip()
+    try:
+        same_host = urllib.parse.urlparse(qr_png).hostname == urllib.parse.urlparse(_pg_base_url()).hostname
+    except Exception:
+        same_host = False
+    if qr_png.startswith('https://') and same_host:
+        return qr_png, order_id
+    raise RuntimeError('Payment created but no usable QR was returned.')
 
-def _verify_paytm_order(order_id):
-    """Paid only when the signed check-payment says 'successful' and the
-    reference / order id / currency / amount all match."""
+def _verify_pg_order(order_id):
+    """Paid only when the gateway says success and the amount equals what it asked the customer to pay."""
     order_id = str(order_id or '')
-    token = _paytm_config()['token']
-    if not order_id or '.' not in token:
+    saved = _pg_load_order(order_id)
+    details = active_orders.get(order_id) or {}
+    gw = str((saved[0] if saved else details.get('gateway')) or _get_active_payment_gateway()).lower()
+    token = _pg_token(gw) if gw in PG_API_NAMES else ''
+    if not order_id or not token:
         return False, None, None
-    saved = _zyvo_load_order(order_id)
-    body = {'order_id': order_id}
-    if saved and saved[0]:
-        body['reference'] = saved[0]
-    status, data, e = _zyvo_request('check-payment.php', body, token, timeout=10)
+    status, data, e = _pg_request('GET', '/api/verify.php', token, params={'order_id': order_id}, timeout=10)
     if e or status is None or status >= 400 or not data:
         return False, None, None
-    d = _zyvo_data(data)
-    if str(d.get('status') or '').strip().lower() != 'successful':
+    if str(data.get('status') or '').strip().lower() != 'success':
+        return False, None, None                       # pending / failed / expired
+    body = data.get('data') if isinstance(data.get('data'), dict) else {}
+    if body.get('order_id') not in (None, '') and str(body.get('order_id')) != order_id:
         return False, None, None
-    if d.get('order_id') not in (None, '') and str(d.get('order_id')) != order_id:
+    expected = saved[3] if saved else details.get('amount')
+    if expected is None or body.get('amount') in (None, '') or not _fam_amount_equals(body.get('amount'), expected):
+        print(f'[PAYGW] order {order_id} amount missing/mismatch; not credited')
         return False, None, None
-    if saved and saved[0] and d.get('reference') not in (None, '') and str(d.get('reference')) != saved[0]:
-        return False, None, None
-    if d.get('currency') not in (None, '') and str(d.get('currency')).upper() != 'INR':
-        return False, None, None
-    details = active_orders.get(order_id) or {}
-    expected = details.get('amount')
-    if expected is None and saved:
-        expected = saved[1]
-    if expected is None or d.get('amount') in (None, '') or not _fam_amount_equals(d.get('amount'), expected):
-        print(f'[PAYTM] order {order_id} amount missing/mismatch; not credited')
-        return False, None, None
-    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(d.get('utr') or d.get('reference') or 'N/A'))[:80] or 'N/A'
-    sender = str(d.get('sender_name') or d.get('payer_name') or 'PayTM/UPI')
-    return True, utr, sender
+    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(body.get('utr') or 'N/A'))[:80] or 'N/A'
+    return True, utr, 'UPI'
 
 def _payment_poll_gap(gateway):
-    return PAYMENT_POLL_INTERVAL
+    return max(PAYMENT_POLL_INTERVAL, PG_MIN_POLL_GAP)
 
 def _check_gateway_connection(gateway):
-    g=str(gateway).lower()
-    if g=='fam': return _check_fam_connection()
-    if g=='paytm': return _check_paytm_connection()
-    return (False,'Unknown payment gateway.')
+    g = str(gateway).lower()
+    if g in PG_API_NAMES: return _check_pg_connection(g)
+    return (False, 'Unknown payment gateway.')
 
 def _create_active_gateway_qr(amount):
-    gw=_get_active_payment_gateway()
-    if gw=='fam': return create_fam_qr(amount)
-    if gw=='paytm': return _create_paytm_dynamic_qr(amount)
-    raise RuntimeError('No payment gateway is ON. Open Admin Panel > Payment Gateway, check the connection and turn a gateway ON.')
+    return _create_pg_qr(amount)
 
-def _verify_active_gateway_order(order_id,gateway=None):
-    details=active_orders.get(str(order_id)) or active_orders.get(order_id) or {}
-    gw=str(gateway or details.get('gateway') or _get_active_payment_gateway()).lower()
-    if gw=='fam': return verify_fam_order(order_id)
-    if gw=='paytm': return _verify_paytm_order(order_id)
-    return False,None,None
+def _verify_active_gateway_order(order_id, gateway=None):
+    return _verify_pg_order(order_id)
 
 
 _load_persistent_admin_ids()
@@ -5426,6 +5320,548 @@ def step_save_adv_plan_id(message):
     bot.send_message(message.chat.id, view, parse_mode='HTML', reply_markup=markup)
 
 
+# ==================== OFFICIAL SELLER API SYSTEM ====================
+# Panel REST API (header: X-API-Key):
+#   GET  /api/v1/connect   -> {connected, username, balance}
+#   GET  /api/v1/balance   -> {balance}
+#   GET  /api/v1/products[?ids=1,4] -> {products:[{product_id,name,plans:[{plan_id,name,price}]}]}
+#   POST /api/v1/purchase  {plan_id} -> {success, key}
+# - Admin only sends the API token; the server link defaults to https://officialseller.shop.
+# - Select Product (IDs) / Import All Products create the hack + plans in the bot.
+#   New hacks are created HIDDEN (product level only). Plans are NOT hidden, so unhiding
+#   the hack in Product Hide / Unhide shows everything.
+# - Bot price = panel reseller price + Percentage (e.g. 80% => price x 1.8).
+# - Per-hack ON/OFF toggle works like Advance API: ON => linked plans are delivered by
+#   Official Seller, other servers are only put on hold; OFF => previous API is back.
+OSL_API_URL_KEY = 'osl_api_url'
+OSL_API_TOKEN_KEY = 'osl_api_token'
+OSL_PERCENT_KEY = 'osl_percent'
+OSL_ENABLED_MAP_KEY = 'osl_enabled_map'   # {hack name: bool}
+OSL_PLAN_MAP_KEY = 'osl_plan_map'         # {local plan id: remote plan_id}
+OSL_DEFAULT_API_URL = (os.getenv('OFFICIAL_SELLER_API_URL', '') or 'https://officialseller.shop').strip()
+_OSL_CATALOG_CACHE = {'ts': 0.0, 'data': None}
+_OSL_CATALOG_TTL = 300
+
+
+def _osl_base_url():
+    raw = str(get_setting(OSL_API_URL_KEY) or OSL_DEFAULT_API_URL).strip().strip('`').strip()
+    if raw and not re.match(r'^https?://', raw, re.I):
+        raw = 'https://' + raw
+    if not re.match(r'^https?://', raw, re.I):
+        return ''
+    raw = raw.rstrip('/')
+    if raw.lower().endswith('/api/v1'):
+        raw = raw[:-7]
+    return raw
+
+
+def _osl_api_token():
+    return str(get_setting(OSL_API_TOKEN_KEY) or '').strip()
+
+
+def _osl_connected():
+    return str(get_setting('osl_api_connected') or '0') == '1'
+
+
+def _osl_percent():
+    try:
+        return max(0.0, float(get_setting(OSL_PERCENT_KEY) or 0))
+    except Exception:
+        return 0.0
+
+
+def _osl_percent_text():
+    p = _osl_percent()
+    return f'{int(p)}%' if p == int(p) else f'{p:g}%'
+
+
+def _osl_markup_price(remote_price):
+    """Panel (reseller) price + admin percentage. 80% => price x 1.8"""
+    return round(float(remote_price) * (1.0 + _osl_percent() / 100.0), 2)
+
+
+def _osl_enabled_map():
+    return _adv_json_get(OSL_ENABLED_MAP_KEY)
+
+
+def _osl_hack_enabled(product_name):
+    return bool(_osl_enabled_map().get(str(product_name), False))
+
+
+def _osl_set_hack_enabled(product_name, enabled):
+    data = _osl_enabled_map()
+    data[str(product_name)] = bool(enabled)
+    _adv_json_set(OSL_ENABLED_MAP_KEY, data)
+
+
+def _osl_plan_map():
+    return _adv_json_get(OSL_PLAN_MAP_KEY)
+
+
+def _osl_plan_remote_id(plan_id):
+    if plan_id is None:
+        return ''
+    return str(_osl_plan_map().get(str(plan_id), '') or '').strip()
+
+
+def _osl_request(method, path, params=None, payload=None, timeout=30):
+    """Return (http_status_or_None, data_dict, error_text). error_text == '' means success."""
+    base, token = _osl_base_url(), _osl_api_token()
+    if not token:
+        return None, {}, 'API Token is not configured.'
+    if not base:
+        return None, {}, 'Invalid Server Link.'
+    headers = {'X-API-Key': token, 'Accept': 'application/json', 'User-Agent': 'RG-Cheat-Shop-Bot/OfficialSeller'}
+    try:
+        resp = HTTP_SESSION.request(method, f'{base}/api/v1{path}', headers=headers, params=params,
+                                    json=payload, timeout=timeout, allow_redirects=True)
+    except Exception as exc:
+        return None, {}, f'Network error: {str(exc)[:250]}'
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    err = ''
+    if data.get('error') and not data.get('success') and not data.get('connected'):
+        e = data.get('error')
+        err = str(e.get('message') if isinstance(e, dict) else e)[:300]
+    elif resp.status_code >= 400:
+        err = str(data.get('message') or f'HTTP {resp.status_code}: {(resp.text or "")[:200]}')[:300]
+    elif not data:
+        err = f'Unexpected reply: {(resp.text or "")[:200] or "empty"}'
+    return resp.status_code, data, err
+
+
+def _osl_check_connection():
+    status, data, err = _osl_request('GET', '/connect', timeout=20)
+    if data.get('connected'):
+        set_setting('osl_api_connected', '1')
+        return True, 'Connect successful (%s, balance %s INR)' % (data.get('username', '?'), data.get('balance', '?')), data
+    set_setting('osl_api_connected', '0')
+    return False, 'Not connected: %s' % (data.get('message') or data.get('error') or err or 'unknown error'), data
+
+
+def _osl_get_balance():
+    status, data, err = _osl_request('GET', '/balance', timeout=20)
+    if err or data.get('balance') is None:
+        return None, err or 'Balance not provided by server.'
+    return data.get('balance'), ''
+
+
+def _osl_clean_products(raw):
+    out = []
+    for p in (raw or []):
+        if not isinstance(p, dict):
+            continue
+        pid = p.get('product_id')
+        name = str(p.get('name') or '').strip()
+        plans = []
+        for pl in (p.get('plans') or []):
+            if not isinstance(pl, dict):
+                continue
+            plid, plname = pl.get('plan_id'), str(pl.get('name') or '').strip()
+            try:
+                price = float(pl.get('price'))
+            except (TypeError, ValueError):
+                price = None
+            if plid in (None, '') or not plname:
+                continue
+            plans.append({'plan_id': str(plid), 'name': plname, 'price': price})
+        if pid in (None, '') or not name:
+            continue
+        out.append({'product_id': str(pid), 'name': name, 'plans': plans})
+    return out
+
+
+def _osl_get_products(ids=None, force=False):
+    """Return (list_of_products_or_None, error_text). ALL products are cached for 5 minutes."""
+    if not ids:
+        cached = _OSL_CATALOG_CACHE.get('data')
+        if not force and cached is not None and time.time() - float(_OSL_CATALOG_CACHE.get('ts') or 0) < _OSL_CATALOG_TTL:
+            return cached, ''
+    params = {'ids': ','.join(str(i) for i in ids)} if ids else None
+    status, data, err = _osl_request('GET', '/products', params=params, timeout=40)
+    if err:
+        return None, err
+    clean = _osl_clean_products(data.get('products'))
+    if not ids:
+        _OSL_CATALOG_CACHE['data'] = clean
+        _OSL_CATALOG_CACHE['ts'] = time.time()
+    return clean, ''
+
+
+def _osl_import_product(prod):
+    """Create/link the bot hack + plans for one panel product.
+
+    - New hack  -> created HIDDEN (product level). Its plans are NOT hidden.
+    - Plan price = panel price + percentage. Plans without a valid price are skipped (never sold for 0).
+    - Existing hack / plan (same name / same duration) keeps its current price and visibility.
+    """
+    remote_name = prod['name']
+    existing_name = None
+    for n in get_unique_products():
+        if _adv_norm(n) == _adv_norm(remote_name):
+            existing_name = n
+            break
+    created_hack = existing_name is None
+    local_name = existing_name or str(remote_name).strip()[:200]
+    plan_map = _osl_plan_map()
+    linked = created = skipped = no_price = 0
+    seen = set()
+    now_text = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
+    try:
+        for pl in prod['plans']:
+            key = _adv_dur_key(pl['name'])
+            if key in seen:
+                skipped += 1
+                continue
+            seen.add(key)
+            rows = conn.execute('SELECT id, days FROM products WHERE name=? ORDER BY id', (local_name,)).fetchall()
+            match = None
+            for r in rows:
+                if _adv_dur_key(r[1]) == key:
+                    match = int(r[0])
+                    break
+            if match is None:
+                if pl['price'] is None or pl['price'] <= 0:
+                    no_price += 1
+                    continue
+                price = _osl_markup_price(pl['price'])
+                order = conn.execute('SELECT COALESCE(MAX(display_order),0)+1 FROM products').fetchone()[0]
+                cur = conn.execute(
+                    '''INSERT INTO products(name,pid_id,days,price,resell_price,is_manual,discount_percent,
+                                            remote_duration,tg_group_link,is_out_of_stock,require_device_id,display_order)
+                       VALUES(?,?,?,?,?,0,0,?,'',0,0,?)''',
+                    (local_name, '0', pl['name'], price, price, pl['name'], int(order or 1)))
+                match = int(cur.lastrowid)
+                created += 1
+            else:
+                linked += 1
+            plan_map[str(match)] = pl['plan_id']
+        if created_hack and (created or linked):
+            conn.execute(
+                '''INSERT INTO product_visibility(product_name,hidden,updated_at) VALUES(?,1,?)
+                   ON CONFLICT(product_name) DO UPDATE SET hidden=1,updated_at=excluded.updated_at''',
+                (local_name, now_text))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    _adv_json_set(OSL_PLAN_MAP_KEY, plan_map)
+    if created_hack and (created or linked):
+        _osl_set_hack_enabled(local_name, True)   # brand-new hack has no previous server
+    return {'name': local_name, 'created_hack': created_hack and bool(created or linked),
+            'linked': linked, 'created': created, 'skipped': skipped, 'no_price': no_price}
+
+
+def _osl_import_many(products):
+    results = []
+    for prod in products:
+        results.append(_osl_import_product(prod))
+    return results
+
+
+def _osl_import_text(results, missing=None):
+    new_h = sum(1 for r in results if r['created_hack'])
+    lines = ['✅ <b>IMPORT COMPLETE</b>', '',
+             f'📦 Products: <b>{len(results)}</b>  ·  🆕 New hacks (hidden): <b>{new_h}</b>',
+             f"➕ New plans: <b>{sum(r['created'] for r in results)}</b>  ·  🔗 Linked: <b>{sum(r['linked'] for r in results)}</b>",
+             f'📈 Percentage used: <b>{_osl_percent_text()}</b>']
+    npz = sum(r['no_price'] for r in results)
+    if npz:
+        lines.append(f'⚠️ Plans skipped (no price from server): {npz}')
+    if missing:
+        lines.append('❌ Not found on server: ' + html.escape(', '.join(str(m) for m in missing)))
+    lines.append('')
+    for r in results[:25]:
+        lines.append(f"{'🆕' if r['created_hack'] else '🔗'} {html.escape(r['name'])} — {r['created']} new / {r['linked']} linked")
+    if len(results) > 25:
+        lines.append(f'… and {len(results) - 25} more')
+    if new_h:
+        lines.append('\n<i>New hacks are hidden. Open Product Hide / Unhide and unhide the hack — its plans are already visible.</i>')
+    return '\n'.join(lines)[:3900]
+
+
+def _osl_sync_prices():
+    """Re-price every linked plan = current panel price + current percentage."""
+    products, err = _osl_get_products(force=True)
+    if products is None:
+        return None, err
+    remote = {pl['plan_id']: pl['price'] for p in products for pl in p['plans']}
+    pm = _osl_plan_map()
+    updated = 0
+    conn = sqlite3.connect(str(BOT_DB_PATH), timeout=15)
+    try:
+        for local_id, rid in pm.items():
+            price = remote.get(str(rid))
+            if price is None or price <= 0:
+                continue
+            new_price = _osl_markup_price(price)
+            conn.execute('UPDATE products SET price=?, resell_price=? WHERE id=?', (new_price, new_price, int(local_id)))
+            updated += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return updated, ''
+
+
+def _osl_route_active(product_name, plan_id):
+    if not product_name or plan_id is None:
+        return False
+    if not _osl_api_token() or not _osl_base_url():
+        return False
+    if not _osl_hack_enabled(product_name):
+        return False
+    return bool(_osl_plan_remote_id(plan_id))
+
+
+def _osl_source_ready_for_plan(product_name, plan_id=None):
+    # Independent of the panel balance: low balance never shows "Out of Stock".
+    if not _osl_route_active(product_name, plan_id):
+        return False
+    if _product_hidden(product_name) or _plan_hidden(plan_id):
+        return False
+    return True
+
+
+def _osl_generate_key(remote_plan_id, purchase_ref=None):
+    """POST /purchase is sent ONCE. A timeout is ambiguous (the panel may have charged),
+    so it is never retried automatically."""
+    pid = str(remote_plan_id).strip()
+    payload = {'plan_id': int(pid) if pid.isdigit() else pid}
+    status, data, err = _osl_request('POST', '/purchase', payload=payload, timeout=90)
+    if data.get('success'):
+        key = data.get('key') or data.get('license_key')
+        if isinstance(key, dict):
+            key = key.get('key') or key.get('license_key')
+        if key and str(key).strip():
+            return str(key).strip()
+        print(f'[OFFICIAL SELLER] purchase ok but no key in reply ref={purchase_ref} plan={pid}: {str(data)[:500]}')
+        return None
+    print(f'[OFFICIAL SELLER] purchase failed ref={purchase_ref} plan={pid} status={status}: {err or data.get("error")}')
+    return None
+
+
+def _osl_panel_text():
+    token, url = _osl_api_token(), _osl_base_url()
+    status = '🟢 Connected Successfully' if _osl_connected() else '🔴 Not Connected'
+    token_line = f'<code>{html.escape(token[:6])}••••••</code>' if token else '<i>Not Set</i>'
+    emap = _osl_enabled_map()
+    active = [n for n in get_unique_products() if emap.get(n)]
+    hacks_line = html.escape(', '.join(active)) if active else '<i>None</i>'
+    return ('🏪 <b>OFFICIAL SELLER API SYSTEM</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+            f'📡 <b>Status:</b> {status}\n🌐 <b>Server:</b> <code>{html.escape(url)}</code>\n'
+            f'🔑 <b>API Token:</b> {token_line}\n📈 <b>Percentage:</b> {_osl_percent_text()}\n'
+            f'🎮 <b>Active Hacks:</b> {hacks_line}\n\n'
+            '<i>Send the API token to connect. Set Percentage, then import products by ID or all at once. '
+            'Imported hacks start hidden (plans stay visible) — unhide them in Product Hide / Unhide.</i>')
+
+
+def _osl_api_markup():
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(_admin_colorful_button('🔑 API Token', callback_data='osl_set_token', color='green'),
+          _admin_colorful_button('🔍 Check Connect', callback_data='osl_check', color='green'))
+    m.add(_admin_colorful_button('💰 Check Balance', callback_data='osl_balance', color='green'))
+    m.row(_admin_colorful_button('🛒 Select Product (IDs)', callback_data='osl_select', color='blue'),
+          _admin_colorful_button('📥 Import All Products', callback_data='osl_import_all', color='blue'))
+    m.add(_admin_colorful_button('🔄 Sync Prices (apply % to all linked plans)', callback_data='osl_sync', color='blue'))
+    m.add(_admin_colorful_button('🎮 Connect Hack (ON / OFF)', callback_data='osl_hacks', color='green'))
+    m.add(_admin_colorful_button('🗑 Delete API', callback_data='osl_delete', color='red'))
+    m.add(_admin_colorful_button(f'📊 Percent System ({_osl_percent_text()})', callback_data='osl_percent_system', color='green'))
+    m.add(_admin_colorful_button('🔙 API & Servers', callback_data='admin_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m))
+
+
+def _send_osl_panel(call):
+    _admin_ui_send(call, _osl_panel_text(), parse_mode='HTML', reply_markup=_osl_api_markup())
+
+
+def _osl_send_panel_message(chat_id):
+    bot.send_message(chat_id, _osl_panel_text(), parse_mode='HTML', reply_markup=_osl_api_markup())
+
+
+def _osl_hacks_markup():
+    pm = _osl_plan_map()
+    emap = _osl_enabled_map()
+    m = types.InlineKeyboardMarkup(row_width=2)
+    count = 0
+    for name in get_unique_products():
+        if not any(str(r[0]) in pm for r in get_product_plans(name)):
+            continue
+        on = bool(emap.get(name))
+        m.add(_admin_colorful_button(f"{'🟢' if on else '⚪'} {name}"[:60], callback_data=f'osl_hack_{_ui_hash(name)}',
+                                     color='green' if on else 'blue'))
+        count += 1
+    m.add(_admin_colorful_button('🔙 Official Seller API', callback_data='osl_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m)), count
+
+
+def _osl_hack_view(product_name):
+    on = _osl_hack_enabled(product_name)
+    pm = _osl_plan_map()
+    lines = [f'🎮 <b>{html.escape(product_name)}</b>', '',
+             f"🏪 <b>Official Seller:</b> {'🟢 ON (linked plans use Official Seller)' if on else '⚪ OFF (previous API in use)'}",
+             f"👁 <b>Visibility:</b> {'🔴 HIDDEN' if _product_hidden(product_name) else '🟢 VISIBLE'}", '', '<b>Plans</b>']
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(_admin_colorful_button('🔴 Turn OFF — use previous API' if on else '🟢 Turn ON — use Official Seller',
+                                 callback_data=f'osl_toggle_{_ui_hash(product_name)}', color='red' if on else 'green'))
+    for row in get_product_plans(product_name):
+        plan_id, days = int(row[0]), str(row[2])
+        rid = pm.get(str(plan_id))
+        try:
+            price_txt = f'₹{float(row[4]):.2f}'
+        except Exception:
+            price_txt = '-'
+        lines.append(f"• {html.escape(days)} → {price_txt} · " + (f'<code>plan #{html.escape(str(rid))}</code>' if rid else 'previous API'))
+    m.add(_admin_colorful_button('🗑 Remove Official Seller Link', callback_data=f'osl_remove_{_ui_hash(product_name)}', color='red'))
+    m.add(_admin_colorful_button('🔙 Hack List', callback_data='osl_hacks', color='red'))
+    return '\n'.join(lines), _style_admin_markup(_ensure_admin_back_button(m))
+
+
+def _osl_step_guard(message, retry_handler=None):
+    uid = int(message.from_user.id)
+    if not _is_admin(uid):
+        return None
+    text = (message.text or '').strip()
+    if _is_command_input(text):
+        _cancel_pending_id_step(uid)
+        admin_temp_data.pop(uid, None)
+        if text.lower().split()[0] == '/start':
+            send_welcome(message)
+        else:
+            bot.send_message(message.chat.id, 'ℹ️ Entry cancelled. Open Official Seller API System again.')
+        return None
+    if not text:
+        if retry_handler:
+            m = bot.send_message(message.chat.id, '❌ Value cannot be empty. Enter it again.')
+            bot.register_next_step_handler(m, retry_handler)
+        return None
+    return text
+
+
+def _osl_report_connection(chat_id):
+    ok, detail, _ = _osl_check_connection()
+    bot.send_message(chat_id, f"{'🟢' if ok else '🔴'} <b>{html.escape(str(detail))}</b>", parse_mode='HTML')
+    _osl_send_panel_message(chat_id)
+
+
+def step_save_osl_token(message):
+    text = _osl_step_guard(message, step_save_osl_token)
+    if text is None:
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)   # keep the token out of the chat
+    except Exception:
+        pass
+    set_setting(OSL_API_TOKEN_KEY, text)
+    set_setting('osl_api_connected', '0')
+    _OSL_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
+    _osl_report_connection(message.chat.id)
+
+
+def step_save_osl_percent(message):
+    text = _osl_step_guard(message, step_save_osl_percent)
+    if text is None:
+        return
+    try:
+        value = float(text.replace('%', '').replace(',', '.').strip())
+        if value < 0 or value > 1000:
+            raise ValueError
+    except ValueError:
+        m = bot.send_message(message.chat.id, '❌ Send a number like <code>80</code> (0 – 1000).', parse_mode='HTML')
+        bot.register_next_step_handler(m, step_save_osl_percent)
+        return
+    set_setting(OSL_PERCENT_KEY, str(value))
+    bot.send_message(message.chat.id,
+                     f'✅ Percentage saved: <b>{_osl_percent_text()}</b>\n\n'
+                     'New imports use it right away. Tap <b>Sync Prices</b> to re-price plans that are already imported.',
+                     parse_mode='HTML')
+    _osl_send_panel_message(message.chat.id)
+
+
+def step_osl_select_ids(message):
+    text = _osl_step_guard(message, step_osl_select_ids)
+    if text is None:
+        return
+    ids = []
+    for x in re.findall(r'\d+', text):
+        if int(x) not in ids:
+            ids.append(int(x))
+    if not ids:
+        m = bot.send_message(message.chat.id, '❌ Send product IDs like <code>1,4,7</code>.', parse_mode='HTML')
+        bot.register_next_step_handler(m, step_osl_select_ids)
+        return
+    products, err = _osl_get_products(ids=ids)
+    if products is None:
+        bot.send_message(message.chat.id, f'❌ Could not load products.\nℹ️ {html.escape(err)}', parse_mode='HTML')
+        _osl_send_panel_message(message.chat.id)
+        return
+    found = {int(p['product_id']) for p in products if p['product_id'].isdigit()}
+    missing = [i for i in ids if i not in found]
+    if not products:
+        bot.send_message(message.chat.id, '❌ None of those product IDs exist on the server.')
+        _osl_send_panel_message(message.chat.id)
+        return
+    try:
+        results = _osl_import_many(products)
+    except Exception as exc:
+        print(f'[OFFICIAL SELLER] import error: {exc}')
+        bot.send_message(message.chat.id, f'❌ Import failed: {html.escape(str(exc)[:200])}', parse_mode='HTML')
+        return
+    bot.send_message(message.chat.id, _osl_import_text(results, missing), parse_mode='HTML')
+    _osl_send_panel_message(message.chat.id)
+
+
+def step_osl_percent_system(message):
+    """Percent System: save the percentage and re-price every plan that is ALREADY imported
+    from Official Seller (panel price + percentage). It never imports/adds products."""
+    text = _osl_step_guard(message, step_osl_percent_system)
+    if text is None:
+        return
+    try:
+        value = float(text.replace('%', '').replace(',', '.').strip())
+        if value < 0 or value > 1000:
+            raise ValueError
+    except ValueError:
+        m = bot.send_message(message.chat.id, '❌ Send a number like <code>100</code> or <code>120</code> (0 – 1000).', parse_mode='HTML')
+        bot.register_next_step_handler(m, step_osl_percent_system)
+        return
+    set_setting(OSL_PERCENT_KEY, str(value))
+    if not _osl_plan_map():
+        bot.send_message(message.chat.id,
+            f'✅ Percentage saved: <b>{_osl_percent_text()}</b>\n\nNo product is imported yet — this percentage will be used for every product you import.',
+            parse_mode='HTML')
+        _osl_send_panel_message(message.chat.id)
+        return
+    wait = bot.send_message(message.chat.id, '⏳ Updating prices of all imported products…')
+    try:
+        updated, err = _osl_sync_prices()
+    except Exception as exc:
+        print(f'[OFFICIAL SELLER] percent system error: {exc}')
+        bot.send_message(message.chat.id, f'❌ Failed: {html.escape(str(exc)[:200])}', parse_mode='HTML')
+        return
+    try:
+        bot.delete_message(message.chat.id, wait.message_id)
+    except Exception:
+        pass
+    if updated is None:
+        bot.send_message(message.chat.id,
+            f'❌ Could not update prices.\nℹ️ {html.escape(str(err))}\n\nPercentage was saved: <b>{_osl_percent_text()}</b>. Tap Percent System again to retry.',
+            parse_mode='HTML')
+    else:
+        bot.send_message(message.chat.id,
+            '✅ <b>PERCENT SYSTEM APPLIED</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+            f'📊 Percentage: <b>{_osl_percent_text()}</b>  (panel price × {1 + value / 100:g})\n'
+            f'💲 Plans re-priced: <b>{updated}</b>',
+            parse_mode='HTML')
+    _osl_send_panel_message(message.chat.id)
+
+
 # ==================== TobiX SELLER API SYSTEM ====================
 def _tobix_base_url(value=None):
     url = str(value if value is not None else get_setting(TOBIX_API_URL_KEY) or TOBIX_DEFAULT_API_URL).strip().strip('`').rstrip('/')
@@ -6442,6 +6878,7 @@ def _api_source_ready_for_plan(product_name, plan_id=None, local_pid_id=None):
     """
     return any((
         _adv_source_ready_for_plan(product_name, plan_id),
+        _osl_source_ready_for_plan(product_name, plan_id),
         _banti_source_ready_for_plan(product_name, plan_id),
         _licence_hub_source_ready_for_plan(product_name, plan_id),
         _ninex_source_ready_for_plan(product_name, plan_id),
@@ -6978,6 +7415,9 @@ def fetch_key_from_api(pid_id, duration, android_id=None, product_name=None, pla
     if route.get('server_type') == 'advance':
         return _adv_generate_key(remote_product_id, purchase_ref=purchase_ref)
 
+    if route.get('server_type') == 'offseller':
+        return _osl_generate_key(remote_product_id, purchase_ref=purchase_ref)
+
     if route.get('server_type') == 'banti':
         return _banti_generate_key(product_name, plan_id, duration, android_id=android_id, purchase_ref=purchase_ref)
 
@@ -7338,81 +7778,6 @@ def _extract_gateway_qr_payload(data, qr_url, order_id, amount, fam_upi):
         f"&tn={urllib.parse.quote(str(order_id))}"
     )
 
-
-def create_fam_qr(amount):
-    """Create a FamPay order (GET /api/create_order.php) and return the bot's own
-    black/white QR image together with the gateway's order_id."""
-    amount = round(float(amount), 2)
-    if not amount > 0:
-        raise RuntimeError('Invalid UPI amount.')
-    upi, key = _fam_credentials()
-    if not key:
-        raise RuntimeError('FamPay API token is not configured.')
-    last_error = 'FamPay could not create the payment order. Please try again.'
-    for attempt in range(2):
-        status, data, err = _fam_get('create_order.php', {'amount': f'{amount:.2f}', 'api_key': key}, timeout=12)
-        if err:
-            last_error = err
-            time.sleep(1)
-            continue
-        if status in (401, 403):
-            raise RuntimeError('FamPay rejected the API token. Re-enter it in the FamPay Gateway settings.')
-        if status is not None and status >= 500:
-            last_error = 'FamPay gateway is temporarily unavailable. Please try again.'
-            time.sleep(1)
-            continue
-        body = data.get('data') if isinstance(data.get('data'), dict) else {}
-        ok = data.get('status') is True or str(data.get('status') or '').lower() == 'success'
-        if not (ok and body.get('order_id')):
-            msg = _fam_message(data)
-            print(f'[FAMPAY] create_order rejected (HTTP {status}): {msg}')
-            raise RuntimeError('FamPay: ' + msg if msg else last_error)
-        order_id = str(body['order_id'])
-        if body.get('amount') not in (None, '') and not _fam_amount_equals(body.get('amount'), amount):
-            raise RuntimeError('FamPay returned a different amount for this order.')
-        qr_url = str(body.get('qr_url') or body.get('qr') or '').strip()
-        try:
-            qr_host = (urllib.parse.urlparse(qr_url).hostname or '').lower()
-            base_host = (urllib.parse.urlparse(_fam_base_url()).hostname or '').lower()
-        except Exception:
-            qr_host = base_host = ''
-        if not (qr_url.startswith('https://') and qr_host and (qr_host == base_host or qr_host.endswith('.' + base_host))):
-            qr_url = ''   # never fetch or show images from an untrusted host
-        payee = str(body.get('upi_id') or upi).strip()
-        if not payee and not qr_url:
-            raise RuntimeError('FamPay UPI ID is not configured.')
-        payload = _extract_gateway_qr_payload(body, qr_url, order_id, amount, payee)
-        try:
-            return _build_stylish_qr_image(payload), order_id
-        except Exception as style_error:
-            print(f'[FAMPAY] styled QR failed: {style_error}')
-            if qr_url:
-                return qr_url, order_id
-            raise RuntimeError('FamPay QR could not be generated.')
-    raise RuntimeError(last_error)
-
-def verify_fam_order(order_id):
-    """GET /api/verify.php. Paid only when status is success and the amount matches."""
-    upi, key = _fam_credentials()
-    order_id = str(order_id or '')
-    if not key or not order_id:
-        return False, None, None
-    status, data, err = _fam_get('verify.php', {'order_id': order_id, 'api_key': key}, timeout=10)
-    if err or status in (401, 403) or not data:
-        return False, None, None
-    if not (data.get('status') is True or str(data.get('status') or '').lower() == 'success'):
-        return False, None, None   # pending / expired / not found
-    body = data.get('data') if isinstance(data.get('data'), dict) else {}
-    if body.get('order_id') not in (None, '') and str(body.get('order_id')) != order_id:
-        return False, None, None
-    details = active_orders.get(order_id) or active_orders.get(order_id.upper()) or {}
-    expected = details.get('amount')
-    if expected is not None and body.get('amount') not in (None, '') and not _fam_amount_equals(body.get('amount'), expected):
-        print(f'[FAMPAY] order {order_id} paid amount does not match the order; not credited')
-        return False, None, None
-    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(body.get('utr') or 'N/A'))[:80] or 'N/A'
-    sender = str(body.get('sender_name') or 'FamPay UPI')
-    return True, utr, sender
 
 def _handle_paid_key_delivery_failure(chat_id, user_id, order_id, amount, pay_type, product_name, product_days, reason='API did not return a key'):
     """Notify admins and compensate a verified paid order exactly once."""
@@ -8059,7 +8424,7 @@ def _admin_return_category_for_callback(data):
         return ("hack_server", "")
     if data in {"new_server_api", "admin_api_system", "admin_server_api_mgmt",
                 "api_srv_add", "tobix_api_system", "tobix_set_token", "tobix_set_url",
-                "tobix_check", "tobix_products"} or data.startswith(("api_srv_", "api_check_", "api_test_", "api_balance_", "new_server_", "tobix_", "banti_", "adv_", "licence_hub")):
+                "tobix_check", "tobix_products"} or data.startswith(("api_srv_", "api_check_", "api_test_", "api_balance_", "new_server_", "tobix_", "banti_", "adv_", "osl_", "licence_hub")):
         return ("api", "")
 
     # Payment gateway and admin-account screens.
@@ -11111,6 +11476,7 @@ def _admin_category_markup(category):
             ("🟢 TobiX API System", "tobix_api_system"),
             (f"🟣 {_banti_name()}", "banti_api_system"),
             ("🚀 Advance API System", "adv_api_system"),
+            ("🏪 Official Seller API System", "osl_api_system"),
             ("🆕 New Server API System", "new_server_api"),
             ("🤝 Reseller API System", "resapi_admin"),
             ("🔌 Admin Licence Manager Hub", "licence_hub"),
@@ -11172,40 +11538,38 @@ def _admin_category_markup(category):
     return _style_admin_markup(markup)
 
 # ==================== PAYMENT GATEWAY & ADMIN MANAGEMENT ====================
-# FamPay setup uses an explicit per-admin state machine. The old callback tried
-# to reference a missing step_save_fam_upi function, which raised NameError as
-# soon as the UPI ID was submitted. Keeping the setup state in admin_temp_data
-# also prevents Telegram next-step timing from making the panel look frozen.
-_FAMP_SETUP_LOCKS = {}
-_FAMP_SETUP_LOCKS_GUARD = threading.RLock()
+# One API, two gateways (FamPay / Paytm). Admin only sends the API token; the bot
+# verifies the connection automatically. The gateway base URL is editable live.
+_PG_SETUP_LOCKS = {}
+_PG_SETUP_LOCKS_GUARD = threading.RLock()
 
-def _famp_setup_lock(user_id):
-    uid = int(user_id)
-    with _FAMP_SETUP_LOCKS_GUARD:
-        return _FAMP_SETUP_LOCKS.setdefault(uid, threading.RLock())
+def _pg_setup_lock(user_id):
+    with _PG_SETUP_LOCKS_GUARD:
+        return _PG_SETUP_LOCKS.setdefault(int(user_id), threading.RLock())
 
-def _start_famp_setup(chat_id, user_id):
+def _start_pg_token_setup(chat_id, user_id, gateway):
+    if not _is_admin(user_id) or gateway not in PG_API_NAMES:
+        return
+    with _pg_setup_lock(user_id):
+        admin_temp_data[int(user_id)] = {'pg_setup_stage': 'token', 'pg_gateway': gateway}
+    bot.send_message(chat_id, f'🔐 <b>{PG_LABELS[gateway].upper()} GATEWAY</b>\n\nSend your <b>API Token</b>.\n<i>The bot connects automatically after saving. /cancel to abort.</i>', parse_mode='HTML')
+
+def _start_pg_url_setup(chat_id, user_id):
     if not _is_admin(user_id):
         return
-    with _famp_setup_lock(user_id):
-        admin_temp_data[int(user_id)] = {
-            'famp_setup_stage': 'upi',
-            'gw_upi': '',
-            'gw_api_key': '',
-        }
-    bot.send_message(
-        chat_id,
-        '💳 <b>FAMP GATEWAY</b>\n\nEnter FAMP UPI ID:',
-        parse_mode='HTML'
-    )
+    with _pg_setup_lock(user_id):
+        admin_temp_data[int(user_id)] = {'pg_setup_stage': 'url'}
+    try: current = _pg_base_url()
+    except Exception: current = '(invalid)'
+    bot.send_message(chat_id, f'🌐 <b>GATEWAY URL</b>\n\nCurrent: <code>{html.escape(current)}</code>\n\nSend the new base URL (example: <code>https://my-site.onrender.com</code>). /cancel to abort.', parse_mode='HTML')
 
 @bot.message_handler(func=lambda message: bool(
     getattr(message, 'from_user', None) and
     _is_admin(message.from_user.id) and
     isinstance(admin_temp_data.get(int(message.from_user.id)), dict) and
-    admin_temp_data.get(int(message.from_user.id), {}).get('famp_setup_stage')
+    admin_temp_data.get(int(message.from_user.id), {}).get('pg_setup_stage')
 ))
-def _handle_famp_setup_message(message):
+def _handle_pg_setup_message(message):
     uid = int(message.from_user.id)
     chat_id = message.chat.id
     text = (message.text or '').strip()
@@ -11213,315 +11577,134 @@ def _handle_famp_setup_message(message):
 
     if command in {'/cancel', '/admin', '/start'}:
         admin_temp_data.pop(uid, None)
-        try:
-            bot.clear_step_handler_by_chat_id(chat_id)
-        except Exception:
-            pass
+        try: bot.clear_step_handler_by_chat_id(chat_id)
+        except Exception: pass
         if command == '/cancel':
-            bot.send_message(chat_id, '✅ <b>FAMP Gateway setup cancelled.</b>', parse_mode='HTML')
-            try:
-                admin_panel(message)
-            except Exception:
-                pass
-        elif command == '/admin':
-            try:
-                admin_panel(message)
-            except Exception:
-                pass
-        else:
-            try:
-                send_welcome(message)
-            except Exception:
-                pass
+            bot.send_message(chat_id, '✅ <b>Gateway setup cancelled.</b>', parse_mode='HTML')
+        try:
+            if command == '/start': send_welcome(message)
+            else: admin_panel(message)
+        except Exception: pass
         return
-
     if not text:
-        bot.send_message(chat_id, '❌ Please send the requested FAMP value as text.')
+        bot.send_message(chat_id, '❌ Please send the value as text.')
         return
 
-    lock = _famp_setup_lock(uid)
-    with lock:
+    with _pg_setup_lock(uid):
         state = admin_temp_data.get(uid)
         if not isinstance(state, dict):
             return
-        stage = str(state.get('famp_setup_stage') or '')
+        stage = str(state.get('pg_setup_stage') or '')
 
-        if stage == 'upi':
-            if '@' not in text or len(text) > 128 or ' ' in text:
-                bot.send_message(chat_id, '❌ Invalid FAMP UPI ID. Send the UPI ID again.')
-                return
-            state['gw_upi'] = text
-            state['famp_setup_stage'] = 'api_key'
-            bot.send_message(
-                chat_id,
-                '🔐 <b>Enter FAMP API Token:</b>\n\n<i>After the token is saved, the bot will verify the API connection automatically.</i>',
-                parse_mode='HTML'
-            )
-            return
-
-        if stage == 'api_key':
-            if len(text) < 8 or len(text) > 512:
-                bot.send_message(chat_id, '❌ Invalid API token length. Send the real FAMP API token again.')
-                return
-
-            upi = str(state.get('gw_upi') or '').strip()
-            state['gw_api_key'] = text
-            try:
-                # Save first so a successful connection check and a process
-                # restart both see exactly the same credentials.
-                _save_gateway('fam', upi, text, text)
-                admin_temp_data.pop(uid, None)
-                bot.send_message(
-                    chat_id,
-                    '⏳ <b>FAMP API Token Saved.</b>\n\nChecking API connection now...',
-                    parse_mode='HTML'
-                )
-
-                def _famp_connection_worker():
-                    ok, detail = _check_fam_connection()
-                    try:
-                        bot.send_message(
-                            chat_id,
-                            ('✅' if ok else '❌') +
-                            f' <b>FAMP Connection {"Successful" if ok else "Failed"}</b>\n\n'
-                            f'<code>{html.escape(str(detail))}</code>',
-                            parse_mode='HTML',
-                            reply_markup=_gateway_manager_markup(),
-                        )
-                    except Exception as exc:
-                        print(f'[FAMP CONNECTION UI ERROR] {exc}')
-
-                _run_user_task_async(_famp_connection_worker)
-            except Exception as exc:
-                admin_temp_data.pop(uid, None)
-                _set_gateway_connected('fam', False)
-                bot.send_message(
-                    chat_id,
-                    f'❌ <b>FAMP save failed.</b>\n\n<code>{html.escape(str(exc)[:700])}</code>',
-                    parse_mode='HTML',
-                    reply_markup=_gateway_manager_markup(),
-                )
-            return
-
-        admin_temp_data.pop(uid, None)
-
-# PayTM setup uses an explicit per-admin state machine instead of depending only
-# on chained next-step handlers. This prevents the exact 'UPI entered -> frozen
-# -> next credential never requested' failure when Telegram/client timing is
-# unusual. Existing step_* functions remain below for backward compatibility.
-_PAYTM_SETUP_LOCKS = {}
-_PAYTM_SETUP_LOCKS_GUARD = threading.RLock()
-
-def _paytm_setup_lock(user_id):
-    uid = int(user_id)
-    with _PAYTM_SETUP_LOCKS_GUARD:
-        return _PAYTM_SETUP_LOCKS.setdefault(uid, threading.RLock())
-
-def _start_paytm_setup(chat_id, user_id):
-    if not _is_admin(user_id):
-        return
-    with _paytm_setup_lock(user_id):
-        admin_temp_data[int(user_id)] = {
-            'paytm_setup_stage': 'upi',
-            'gw_upi': '',
-            'gw_api_key': '',
-        }
-    bot.send_message(
-        chat_id,
-        '💳 <b>PAYTM GATEWAY</b>\n\nEnter PayTM UPI ID:',
-        parse_mode='HTML'
-    )
-
-@bot.message_handler(func=lambda message: bool(
-    getattr(message, 'from_user', None) and
-    _is_admin(message.from_user.id) and
-    isinstance(admin_temp_data.get(int(message.from_user.id)), dict) and
-    admin_temp_data.get(int(message.from_user.id), {}).get('paytm_setup_stage')
-))
-def _handle_paytm_setup_message(message):
-    uid = int(message.from_user.id)
-    chat_id = message.chat.id
-    text = (message.text or '').strip()
-    command = text.split()[0].lower() if text else ''
-    if command in {'/cancel', '/admin', '/start'}:
-        admin_temp_data.pop(uid, None)
-        try:
-            bot.clear_step_handler_by_chat_id(chat_id)
-        except Exception:
-            pass
-        if command == '/cancel':
-            bot.send_message(chat_id, '✅ <b>PayTM Gateway setup cancelled.</b>', parse_mode='HTML')
-            try:
-                admin_panel(message)
-            except Exception:
-                pass
-        elif command == '/admin':
-            try:
-                admin_panel(message)
-            except Exception:
-                pass
-        else:
-            try:
-                send_welcome(message)
-            except Exception:
-                pass
-        return
-    if not text:
-        bot.send_message(chat_id, '❌ Please send the requested PayTM value as text.')
-        return
-
-    lock = _paytm_setup_lock(uid)
-    with lock:
-        state = admin_temp_data.get(uid)
-        if not isinstance(state, dict):
-            return
-        stage = str(state.get('paytm_setup_stage') or '')
-
-        if stage == 'upi':
-            if '@' not in text or len(text) > 128 or ' ' in text:
-                bot.send_message(chat_id, '❌ Invalid PayTM UPI ID. Send the UPI ID again.')
-                return
-            state['gw_upi'] = text
-            state['paytm_setup_stage'] = 'api_key'
-            bot.send_message(
-                chat_id,
-                '🔐 <b>Enter PayTM API Token:</b>\n\n<i>After the token is saved, the bot will verify the connection automatically.</i>',
-                parse_mode='HTML'
-            )
-            return
-
-        if stage == 'api_key':
+        if stage == 'token':
+            gateway = str(state.get('pg_gateway') or '')
+            if gateway not in PG_API_NAMES:
+                admin_temp_data.pop(uid, None); return
             if len(text) < 8 or len(text) > 512 or ' ' in text:
-                bot.send_message(chat_id, '❌ Invalid API token. Send the real PayTM API token again.')
+                bot.send_message(chat_id, '❌ Invalid API token. Send the real API token again.')
                 return
-            upi = str(state.get('gw_upi') or '').strip()
+            admin_temp_data.pop(uid, None)
+            try: bot.delete_message(chat_id, message.message_id)   # do not leave the token in chat
+            except Exception: pass
             try:
-                _save_gateway('paytm', upi, text, text)
-                admin_temp_data.pop(uid, None)
-                # Hide the message that contains the secret token.
-                try:
-                    bot.delete_message(chat_id, message.message_id)
-                except Exception:
-                    pass
-                bot.send_message(chat_id, '⏳ <b>PayTM API Token Saved.</b>\n\nChecking connection now...', parse_mode='HTML')
-
-                def _paytm_connection_worker():
-                    ok, detail = _check_paytm_connection()
-                    try:
-                        bot.send_message(
-                            chat_id,
-                            ('✅ <b>PayTM Connect Successful</b>' if ok else '❌ <b>PayTM Not Connected</b>') +
-                            f'\n\n<code>{html.escape(str(detail))}</code>' +
-                            ('\n\nNow turn <b>PayTM System ON</b> to use it.' if ok else ''),
-                            parse_mode='HTML',
-                            reply_markup=_gateway_manager_markup(),
-                        )
-                    except Exception as exc:
-                        print(f'[PAYTM CONNECTION UI ERROR] {exc}')
-
-                _run_user_task_async(_paytm_connection_worker)
+                _save_gateway(gateway, 'api', text, text)
             except Exception as exc:
-                admin_temp_data.pop(uid, None)
-                _set_gateway_connected('paytm', False)
-                bot.send_message(
-                    chat_id,
-                    f'❌ <b>PayTM save failed.</b>\n\n<code>{html.escape(str(exc)[:700])}</code>',
-                    parse_mode='HTML',
-                    reply_markup=_gateway_manager_markup(),
-                )
+                bot.send_message(chat_id, f'❌ <b>Save failed.</b>\n\n<code>{html.escape(str(exc)[:700])}</code>', parse_mode='HTML', reply_markup=_gateway_manager_markup())
+                return
+            bot.send_message(chat_id, f'⏳ <b>{PG_LABELS[gateway]} API Token Saved.</b>\n\nConnecting now...', parse_mode='HTML')
+
+            def _pg_connect_worker():
+                ok, detail = _check_pg_connection(gateway)
+                auto_on = False
+                if ok and not _get_active_payment_gateway():
+                    auto_on = _set_active_payment_gateway(gateway)     # nothing is ON yet -> start working immediately
+                try:
+                    bot.send_message(
+                        chat_id,
+                        ('✅ <b>Connect Successful</b>' if ok else '❌ <b>Not Connected</b>') +
+                        f'\n\n<code>{html.escape(str(detail))}</code>' +
+                        (f'\n\n🟢 <b>{PG_LABELS[gateway]} System ON.</b>' if auto_on else ''),
+                        parse_mode='HTML', reply_markup=_gateway_manager_markup())
+                except Exception as exc:
+                    print(f'[PAYGW CONNECT UI ERROR] {exc}')
+            _run_user_task_async(_pg_connect_worker)
+            return
+
+        if stage == 'url':
+            new_url = _pg_normalize_base_url(text)
+            if not new_url:
+                bot.send_message(chat_id, '❌ Invalid URL. It must be an https URL. Send it again.')
+                return
+            admin_temp_data.pop(uid, None)
+            set_setting(PG_BASE_URL_KEY, new_url)
+            bot.send_message(chat_id, f'✅ <b>Gateway URL updated.</b>\n\n<code>{html.escape(new_url)}</code>\n\n⏳ Re-checking saved tokens...', parse_mode='HTML')
+
+            def _pg_url_worker():
+                lines = []
+                for gw in ('fam', 'paytm'):
+                    if _pg_token(gw):
+                        ok, detail = _check_pg_connection(gw)
+                        lines.append(f"{'✅' if ok else '❌'} {PG_LABELS[gw]}: {html.escape(str(detail))}")
+                try:
+                    bot.send_message(chat_id, '\n'.join(lines) or 'No API token saved yet.', parse_mode='HTML', reply_markup=_gateway_manager_markup())
+                except Exception as exc:
+                    print(f'[PAYGW URL UI ERROR] {exc}')
+            _run_user_task_async(_pg_url_worker)
             return
 
         admin_temp_data.pop(uid, None)
-
 
 def _gateway_manager_markup():
-    active=_get_active_payment_gateway()
-    m=types.InlineKeyboardMarkup(row_width=1)
-    m.row(make_ui_button(f"{'🟢' if active=='fam' else '⚪'} FamPay Gateway\n{_gateway_status_line('fam')}", callback_data='gw_edit_fam', button_key='admin:gateway:fam_edit', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔍 Check FamPay Connection', callback_data='gw_check_fam', button_key='admin:gateway:fam_check', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔘 FamPay System '+('ON' if active=='fam' else 'OFF'), callback_data='gw_toggle_fam', button_key='admin:gateway:fam_toggle', default_color='green' if active=='fam' else 'red', force_style=True))
-    m.row(make_ui_button(f"{'🟢' if active=='paytm' else '⚪'} PayTM Gateway\n{_gateway_status_line('paytm')}", callback_data='gw_edit_paytm', button_key='admin:gateway:paytm_edit', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔍 Check PayTM Connection', callback_data='gw_check_paytm', button_key='admin:gateway:paytm_check', default_color='blue', force_style=True))
-    m.row(make_ui_button('🔘 PayTM System '+('ON' if active=='paytm' else 'OFF'), callback_data='gw_toggle_paytm', button_key='admin:gateway:paytm_toggle', default_color='green' if active=='paytm' else 'red', force_style=True))
+    active = _get_active_payment_gateway()
+    m = types.InlineKeyboardMarkup(row_width=1)
+    for gw in ('fam', 'paytm'):
+        label = PG_LABELS[gw]
+        m.row(make_ui_button(f"{'🟢' if active == gw else '⚪'} {label} Gateway\n{_gateway_status_line(gw)}", callback_data=f'gw_edit_{gw}', button_key=f'admin:gateway:{gw}_edit', default_color='blue', force_style=True))
+        m.row(make_ui_button(f'🔍 Check {label} Connection', callback_data=f'gw_check_{gw}', button_key=f'admin:gateway:{gw}_check', default_color='blue', force_style=True))
+        m.row(make_ui_button(f'🔘 {label} System ' + ('ON' if active == gw else 'OFF'), callback_data=f'gw_toggle_{gw}', button_key=f'admin:gateway:{gw}_toggle', default_color='green' if active == gw else 'red', force_style=True))
+    m.row(make_ui_button('🌐 Edit Gateway URL', callback_data='gw_edit_url', button_key='admin:gateway:url_edit', default_color='blue', force_style=True))
     m.row(make_ui_button('⏳ Pending Payments', callback_data='admin_view_pending_payments', button_key='admin:gateway:pending', default_color='blue', force_style=True))
     m.row(make_ui_button('🔙 Main Admin Panel', callback_data='admin_back_main', button_key='admin:navigation:back', default_color='red', force_style=True))
     return m
 
-def _send_gateway_manager(chat_id,message_id=None):
-    active=_get_active_payment_gateway(); label='FamPay' if active=='fam' else ('PayTM' if active=='paytm' else 'None')
-    text=f"💳 <b>PAYMENT GATEWAY</b>\n\n⚡ <b>Active Gateway:</b> {label}\nTurning one gateway ON automatically turns the other OFF."
-    markup=_gateway_manager_markup()
+def _send_gateway_manager(chat_id, message_id=None):
+    active = _get_active_payment_gateway(); label = PG_LABELS.get(active, 'None')
+    try: host = urllib.parse.urlparse(_pg_base_url()).hostname or '?'
+    except Exception: host = '(invalid URL)'
+    text = (f"💳 <b>PAYMENT GATEWAY</b>\n\n⚡ <b>Active Gateway:</b> {label}\n🌐 <b>Server:</b> <code>{html.escape(host)}</code>\n"
+            "Turning one gateway OFF automatically turns the other ON.")
+    markup = _gateway_manager_markup()
     if message_id:
-        try: return bot.edit_message_text(text,chat_id=chat_id,message_id=message_id,parse_mode='HTML',reply_markup=markup)
+        try: return bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode='HTML', reply_markup=markup)
         except Exception: pass
-    return bot.send_message(chat_id,text,parse_mode='HTML',reply_markup=markup)
-def step_save_paytm_upi(message):
-    uid=message.from_user.id
-    if not _is_admin(uid): return
-    upi=(message.text or '').strip()
-    if not upi or '@' not in upi:
-        m=bot.send_message(message.chat.id,'❌ Invalid PayTM UPI ID. Send the UPI ID again.'); bot.register_next_step_handler(m,step_save_paytm_upi); return
-    admin_temp_data.setdefault(uid,{})['gw_upi']=upi
-    m=bot.send_message(message.chat.id,'🆔 <b>Enter PayTM Merchant ID (MID):</b>',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_merchant)
+    return bot.send_message(chat_id, text, parse_mode='HTML', reply_markup=markup)
 
-def step_save_paytm_merchant(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    mid=(message.text or '').strip()
-    if not mid or not d.get('gw_upi'):
-        m=bot.send_message(message.chat.id,'❌ Merchant ID cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_merchant); return
-    d['gw_merchant_id']=mid
-    m=bot.send_message(message.chat.id,'🔐 <b>Enter PayTM Merchant Key:</b>',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_merchant_key)
+def _gateway_toggle(chat_id, gateway):
+    gateway = str(gateway).lower().strip()
+    if gateway not in PG_API_NAMES:
+        bot.send_message(chat_id, '❌ <b>Unknown payment gateway.</b>', parse_mode='HTML')
+        _send_gateway_manager(chat_id); return
+    label = PG_LABELS[gateway]
+    other = 'paytm' if gateway == 'fam' else 'fam'
 
-def step_save_paytm_merchant_key(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    key=(message.text or '').strip()
-    if not key or not d.get('gw_upi') or not d.get('gw_merchant_id'):
-        m=bot.send_message(message.chat.id,'❌ Merchant Key cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_merchant_key); return
-    d['gw_merchant_key']=key
-    m=bot.send_message(message.chat.id,'🖥️ <b>Enter PayTM POS ID:</b>\n\nRequired for Dynamic QR.',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_pos_id)
+    if _get_active_payment_gateway() == gateway:            # turning OFF -> the other one turns ON
+        if _pg_token(other) and _set_active_payment_gateway(other):
+            bot.send_message(chat_id, f'⚪ <b>{label} System OFF.</b>\n🟢 <b>{PG_LABELS[other]} System ON</b> automatically.', parse_mode='HTML')
+        else:
+            set_setting('active_payment_gateway', '')
+            bot.send_message(chat_id, f'⚪ <b>{label} System OFF.</b>\n⚠️ {PG_LABELS[other]} has no API token, so no gateway is ON now.', parse_mode='HTML')
+        _send_gateway_manager(chat_id); return
 
-def step_save_paytm_pos_id(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    pos=(message.text or '').strip()
-    if not pos or not d.get('gw_upi') or not d.get('gw_merchant_id') or not d.get('gw_merchant_key'):
-        m=bot.send_message(message.chat.id,'❌ POS ID cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_pos_id); return
-    d['gw_pos_id']=pos
-    m=bot.send_message(message.chat.id,'🧩 <b>Enter PayTM Client ID:</b>\n\nStandard accounts may use <code>C11</code>.',parse_mode='HTML'); bot.register_next_step_handler(m,step_save_paytm_client_id)
-
-def step_save_paytm_client_id(message):
-    uid=message.from_user.id; d=admin_temp_data.get(uid,{})
-    client=(message.text or '').strip()
-    if client.upper()=='SKIP': client=str(get_setting('paytm_client_id') or PAYTM_DEFAULT_CLIENT_ID).strip() or 'C11'
-    if not client or not d.get('gw_upi') or not d.get('gw_merchant_id') or not d.get('gw_merchant_key') or not d.get('gw_pos_id'):
-        m=bot.send_message(message.chat.id,'❌ Client ID cannot be empty.'); bot.register_next_step_handler(m,step_save_paytm_client_id); return
-    _save_gateway('paytm',d['gw_upi'],d['gw_merchant_id'],d['gw_merchant_key'])
-    set_setting('paytm_pos_id',d['gw_pos_id']); set_setting('paytm_client_id',client); admin_temp_data.pop(uid,None)
-    bot.send_message(message.chat.id,'💾 <b>PayTM Gateway Saved.</b>\n\nPayTM remains <b>OFF</b> until you check the connection and explicitly turn it ON.',parse_mode='HTML',reply_markup=_gateway_manager_markup())
-
-def _gateway_toggle(chat_id,gateway):
-    gateway=str(gateway).lower().strip(); row=_gateway_row(gateway)
-    label={'fam':'FamPay','paytm':'PayTM'}.get(gateway,gateway.upper())
-    if gateway not in {'fam','paytm'}:
-        bot.send_message(chat_id,'❌ <b>Unknown payment gateway.</b>',parse_mode='HTML')
-        _send_gateway_manager(chat_id)
-        return
-    if _get_active_payment_gateway() == gateway:
-        set_setting('active_payment_gateway','')
-        bot.send_message(chat_id,f'⚪ <b>{label} System OFF.</b>',parse_mode='HTML')
-        _send_gateway_manager(chat_id)
-        return
-    configured = bool(row and row[1] and row[2])
-    if not row or not configured:
-        bot.send_message(chat_id,f'❌ <b>{label} is not configured.</b>',parse_mode='HTML'); return
+    if not _pg_token(gateway):
+        bot.send_message(chat_id, f'❌ <b>{label} is not configured.</b> Tap the {label} Gateway button and send the API token.', parse_mode='HTML'); return
+    row = _gateway_row(gateway)
     if not int(row[4] or 0):
-        bot.send_message(chat_id,f'❌ <b>{label} is not connected.</b> Use Check Connection first.',parse_mode='HTML'); return
-    if gateway=='paytm':
-        ready=_paytm_payment_config_error()
-        if ready:
-            bot.send_message(chat_id,'❌ <b>PayTM cannot be turned ON yet.</b>\n\n'+html.escape(ready),parse_mode='HTML'); return
+        ok, detail = _check_pg_connection(gateway)
+        if not ok:
+            bot.send_message(chat_id, f'❌ <b>{label} is not connected.</b>\n\n<code>{html.escape(str(detail))}</code>', parse_mode='HTML'); return
     if not _set_active_payment_gateway(gateway):
-        bot.send_message(chat_id,f'❌ <b>{label} could not be activated.</b>',parse_mode='HTML'); return
-    bot.send_message(chat_id,f'🟢 <b>{label} System ON.</b> The other gateway is automatically OFF.',parse_mode='HTML')
+        bot.send_message(chat_id, f'❌ <b>{label} could not be activated.</b>', parse_mode='HTML'); return
+    bot.send_message(chat_id, f'🟢 <b>{label} System ON.</b> {PG_LABELS[other]} is automatically OFF.', parse_mode='HTML')
     _send_gateway_manager(chat_id)
 
 
@@ -13027,6 +13210,10 @@ def _resolve_api_route(product_name, plan_id=None, local_pid_id=None, duration=N
     if _adv_route_active(product_name, plan_id):
         return {'url': _adv_base_url(), 'api_key': _adv_api_token(),
                 'product_id': _adv_plan_remote_id(plan_id), 'valid_id': '', 'server_type': 'advance'}
+    # Official Seller: same rule as Advance - ON for a hack => its linked plans use Official Seller.
+    if _osl_route_active(product_name, plan_id):
+        return {'url': _osl_base_url(), 'api_key': _osl_api_token(),
+                'product_id': _osl_plan_remote_id(plan_id), 'valid_id': '', 'server_type': 'offseller'}
     # Banti has the highest priority: while a hack is enabled for Banti, every
     # other server stays on hold for that hack. Disable it to go back.
     if (product_name and not _product_hidden(product_name) and _banti_product_enabled(product_name)
@@ -16731,7 +16918,7 @@ def show_upi_checkout(chat_id, product_id, message_id=None, device_id=None):
             f"└── 🆔 <b>Order ID:</b> <code>{html.escape(str(order_ref), quote=False)}</code>",
             "📱 <b>How to Pay:</b>\n"
             "├── 1️⃣ Scan the QR Code above using any UPI app\n"
-            f"├── 2️⃣ Pay exact amount: <b>₹{final_price:.2f}</b>\n"
+            f"├── 2️⃣ Pay exact amount: <b>₹{_pg_exact_amount(order_ref, final_price):.2f}</b>\n"
             "└── 3️⃣ Wait a few seconds for auto-verification!",
             "────────────────────────\n"
             "⚡ <i>Auto-checking live payment in background...</i>",
@@ -19020,55 +19207,35 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
 
     elif call.data == "admin_gateway_manager":
         if _is_admin(user_id): _send_gateway_manager(call.message.chat.id, message_id=call.message.message_id)
-    elif call.data == "gw_edit_fam":
+    elif call.data in ("gw_edit_fam", "gw_edit_paytm"):
         if _is_admin(user_id):
             _fast_callback_ack(call)
-            _start_famp_setup(call.message.chat.id, user_id)
-    elif call.data == "gw_check_fam":
-        if _is_admin(user_id):
-            _fast_callback_ack(call)
-            chat_id = call.message.chat.id
-            message_id = call.message.message_id
-            def _fam_connection_worker():
-                ok, detail = _check_fam_connection()
-                try:
-                    bot.send_message(
-                        chat_id,
-                        ("✅" if ok else "❌") +
-                        f" <b>FamPay Connection {'Successful' if ok else 'Failed'}</b>\n\n"
-                        f"<code>{html.escape(str(detail))}</code>",
-                        parse_mode='HTML',
-                    )
-                    _send_gateway_manager(chat_id, message_id=message_id)
-                except Exception as exc:
-                    print(f'[FAMPAY CONNECTION UI ERROR] {exc}')
-            _run_user_task_async(_fam_connection_worker)
-    elif call.data == "gw_toggle_fam":
-        if _is_admin(user_id): _gateway_toggle(call.message.chat.id, "fam")
-    elif call.data == "gw_edit_paytm":
-        if _is_admin(user_id):
-            _fast_callback_ack(call)
-            _start_paytm_setup(call.message.chat.id, user_id)
-    elif call.data == "gw_check_paytm":
+            _start_pg_token_setup(call.message.chat.id, user_id, call.data.rsplit("_", 1)[1])
+    elif call.data in ("gw_check_fam", "gw_check_paytm"):
         if _is_admin(user_id):
             _fast_callback_ack(call)
             chat_id = call.message.chat.id
             message_id = call.message.message_id
-            def _paytm_check_worker():
-                ok, detail = _check_paytm_connection()
+            _gw = call.data.rsplit("_", 1)[1]
+            def _pg_check_worker():
+                ok, detail = _check_pg_connection(_gw)
                 try:
                     bot.send_message(
                         chat_id,
-                        ("✅ <b>PayTM Connect Successful</b>" if ok else "❌ <b>PayTM Not Connected</b>") +
+                        ("✅ <b>Connect Successful</b>" if ok else "❌ <b>Not Connected</b>") +
                         f"\n\n<code>{html.escape(str(detail))}</code>",
                         parse_mode='HTML',
                     )
                     _send_gateway_manager(chat_id, message_id=message_id)
                 except Exception as exc:
-                    print(f'[PAYTM CONNECTION UI ERROR] {exc}')
-            _run_user_task_async(_paytm_check_worker)
-    elif call.data == "gw_toggle_paytm":
-        if _is_admin(user_id): _gateway_toggle(call.message.chat.id, "paytm")
+                    print(f'[PAYGW CONNECTION UI ERROR] {exc}')
+            _run_user_task_async(_pg_check_worker)
+    elif call.data in ("gw_toggle_fam", "gw_toggle_paytm"):
+        if _is_admin(user_id): _gateway_toggle(call.message.chat.id, call.data.rsplit("_", 1)[1])
+    elif call.data == "gw_edit_url":
+        if _is_admin(user_id):
+            _fast_callback_ack(call)
+            _start_pg_url_setup(call.message.chat.id, user_id)
     elif call.data == "admin_manage_admins":
         if _is_admin(user_id): _send_admin_manager(call.message.chat.id, message_id=call.message.message_id)
     elif call.data == "admin_add_id":
@@ -20174,6 +20341,179 @@ def handle_menu_click(call):  # pyright: ignore[reportGeneralTypeIssues]
             _ADV_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
             bot.answer_callback_query(call.id, 'Advance API deleted — previous APIs restored')
             _send_adv_panel(call)
+
+    elif call.data == 'osl_api_system':
+        if _is_admin(user_id):
+            _send_osl_panel(call)
+
+    elif call.data == 'osl_set_token':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call, '🔑 <b>Send your Official Seller API Token:</b>', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_osl_token)
+
+    elif call.data == 'osl_check':
+        if _is_admin(user_id):
+            ok, detail, _ = _osl_check_connection()
+            bot.answer_callback_query(call.id, str(detail)[:190], show_alert=True)
+            _send_osl_panel(call)
+
+    elif call.data == 'osl_balance':
+        if _is_admin(user_id):
+            bal, err = _osl_get_balance()
+            if bal is None:
+                set_setting('osl_api_connected', '0')
+                bot.answer_callback_query(call.id, f'Not connected\n{err}'[:190], show_alert=True)
+            else:
+                set_setting('osl_api_connected', '1')
+                bot.answer_callback_query(call.id, f'💰 Balance: {_adv_money(bal)} INR', show_alert=True)
+            _send_osl_panel(call)
+
+    elif call.data == 'osl_percent':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call,
+                f'📈 <b>Send Percentage</b> (current: <b>{_osl_percent_text()}</b>)\n\n'
+                'Example: <code>80</code> → panel reseller price + 80% (price × 1.8).\n'
+                'Send <code>0</code> to use the panel price as it is.',
+                parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_osl_percent)
+
+    elif call.data == 'osl_select':
+        if _is_admin(user_id):
+            if not _osl_api_token():
+                bot.answer_callback_query(call.id, 'Send the API Token first.', show_alert=True)
+                return
+            products, err = _osl_get_products(force=True)
+            if products is None:
+                bot.answer_callback_query(call.id, f'Could not load products.\n{err}'[:190], show_alert=True)
+                return
+            lines, size = [], 0
+            for p in products:
+                line = f"<code>{html.escape(p['product_id'])}</code> — {html.escape(p['name'])} ({len(p['plans'])})"
+                if size + len(line) > 2800:
+                    lines.append(f'… +{len(products) - len(lines)} more')
+                    break
+                lines.append(line)
+                size += len(line) + 1
+            m = _admin_ui_send(call,
+                '🛒 <b>SELECT PRODUCT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                + ('\n'.join(lines) if lines else '<i>No products on the server.</i>')
+                + f'\n\n📈 Percentage: <b>{_osl_percent_text()}</b>\n'
+                '👉 <b>Send the product IDs to import</b>, e.g. <code>1,4,7</code>',
+                parse_mode='HTML')
+            bot.register_next_step_handler(m, step_osl_select_ids)
+
+    elif call.data == 'osl_import_all':
+        if _is_admin(user_id):
+            products, err = _osl_get_products(force=True)
+            if not products:
+                bot.answer_callback_query(call.id, f'Could not load products.\n{err or "Catalog is empty."}'[:190], show_alert=True)
+                return
+            try:
+                results = _osl_import_many(products)
+            except Exception as exc:
+                print(f'[OFFICIAL SELLER] import-all error: {exc}')
+                bot.answer_callback_query(call.id, f'Import failed: {str(exc)[:150]}', show_alert=True)
+                return
+            bot.answer_callback_query(call.id, f'Imported {len(results)} products')
+            _admin_ui_send(call, _osl_import_text(results), parse_mode='HTML', reply_markup=_osl_api_markup())
+
+    elif call.data == 'osl_percent_system':
+        if _is_admin(user_id):
+            if not _osl_api_token():
+                bot.answer_callback_query(call.id, 'Send the API Token first.', show_alert=True)
+                return
+            m = _admin_ui_send(call,
+                '📊 <b>PERCENT SYSTEM</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                f'Current: <b>{_osl_percent_text()}</b>\n\n'
+                'Send a percentage — the price of <b>all already imported products</b> is updated at once '
+                '(<b>panel price + percentage</b>). No product is added or imported here.\n\n'
+                '• <code>100</code> → price × 2\n• <code>120</code> → price × 2.2\n• <code>0</code> → panel price as it is\n\n'
+                '<i>This re-prices all Official Seller plans, including ones you edited manually.</i>',
+                parse_mode='HTML')
+            bot.register_next_step_handler(m, step_osl_percent_system)
+
+    elif call.data == 'osl_sync':
+        if _is_admin(user_id):
+            updated, err = _osl_sync_prices()
+            if updated is None:
+                bot.answer_callback_query(call.id, f'Sync failed.\n{err}'[:190], show_alert=True)
+            else:
+                bot.answer_callback_query(call.id, f'Re-priced {updated} plans at {_osl_percent_text()}', show_alert=True)
+            _send_osl_panel(call)
+
+    elif call.data == 'osl_hacks':
+        if _is_admin(user_id):
+            markup, count = _osl_hacks_markup()
+            _admin_ui_send(call,
+                '🎮 <b>OFFICIAL SELLER — CONNECT HACK</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                + ('Tap a hack to turn Official Seller ON / OFF.\n🟢 = Official Seller · ⚪ = previous API'
+                   if count else 'No hack is linked yet. Use <b>Select Product</b> or <b>Import All</b> first.'),
+                parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('osl_hack_'):
+        if _is_admin(user_id):
+            product_name = _adv_hack_by_hash(call.data.replace('osl_hack_', '', 1))
+            if not product_name:
+                return
+            view, markup = _osl_hack_view(product_name)
+            _admin_ui_send(call, view, parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('osl_toggle_'):
+        if _is_admin(user_id):
+            product_name = _adv_hack_by_hash(call.data.replace('osl_toggle_', '', 1))
+            if not product_name:
+                return
+            new_state = not _osl_hack_enabled(product_name)
+            if new_state:
+                if not _osl_api_token() or not _osl_base_url():
+                    bot.answer_callback_query(call.id, 'Send the API Token first.', show_alert=True)
+                    return
+                if not _osl_connected():
+                    bot.answer_callback_query(call.id, 'Tap Check Connect first — the API is not connected.', show_alert=True)
+                    return
+                pm = _osl_plan_map()
+                if not any(str(r[0]) in pm for r in get_product_plans(product_name)):
+                    bot.answer_callback_query(call.id, 'No plan of this hack is linked to a server plan.', show_alert=True)
+                    return
+            _osl_set_hack_enabled(product_name, new_state)
+            bot.answer_callback_query(call.id, 'Official Seller ON — previous API on hold' if new_state else 'Official Seller OFF — previous API restored')
+            view, markup = _osl_hack_view(product_name)
+            _admin_ui_send(call, view, parse_mode='HTML', reply_markup=markup)
+
+    elif call.data.startswith('osl_remove_'):
+        if _is_admin(user_id):
+            product_name = _adv_hack_by_hash(call.data.replace('osl_remove_', '', 1))
+            if not product_name:
+                return
+            pm = _osl_plan_map()
+            for row in get_product_plans(product_name):
+                pm.pop(str(int(row[0])), None)
+            _adv_json_set(OSL_PLAN_MAP_KEY, pm)
+            _osl_set_hack_enabled(product_name, False)
+            bot.answer_callback_query(call.id, 'Link removed — previous API restored')
+            markup, count = _osl_hacks_markup()
+            _admin_ui_send(call, '🎮 <b>OFFICIAL SELLER — CONNECT HACK</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                           + ('Tap a hack to turn Official Seller ON / OFF.' if count else 'No hack is linked yet.'),
+                           parse_mode='HTML', reply_markup=markup)
+
+    elif call.data == 'osl_delete':
+        if _is_admin(user_id):
+            m = types.InlineKeyboardMarkup(row_width=1)
+            m.add(_admin_colorful_button('✅ Yes, delete API', callback_data='osl_delete_yes', color='red'))
+            m.add(_admin_colorful_button('🔙 Cancel', callback_data='osl_api_system', color='blue'))
+            _admin_ui_send(call,
+                '🗑 <b>Delete Official Seller API?</b>\n\nToken is removed and every hack goes back to its previous API.\n'
+                '<i>Your hacks, plans and prices are not deleted.</i>',
+                parse_mode='HTML', reply_markup=_style_admin_markup(_ensure_admin_back_button(m)))
+
+    elif call.data == 'osl_delete_yes':
+        if _is_admin(user_id):
+            set_setting(OSL_API_TOKEN_KEY, '')
+            set_setting('osl_api_connected', '0')
+            _adv_json_set(OSL_ENABLED_MAP_KEY, {})
+            _OSL_CATALOG_CACHE.update({'ts': 0.0, 'data': None})
+            bot.answer_callback_query(call.id, 'Official Seller API deleted — previous APIs restored')
+            _send_osl_panel(call)
 
     elif call.data == 'banti_api_system':
         if _is_admin(user_id):
