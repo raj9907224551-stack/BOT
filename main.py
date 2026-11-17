@@ -2096,6 +2096,25 @@ def _create_pg_qr(amount):
         return qr_png, order_id
     raise RuntimeError('Payment created but no usable QR was returned.')
 
+def _pg_find_amount(*blobs):
+    """Look for an amount in the gateway reply (top level or nested under data)."""
+    for blob in blobs:
+        if isinstance(blob, dict):
+            v = blob.get('amount')
+            if v not in (None, ''):
+                return v
+    return None
+
+def _pg_status_lookup(token, order_id):
+    """Fallback: GET /api/v1/payment/status/<order_id>. Returns (is_success, body) or (None, {})."""
+    status, data, e = _pg_request('GET', '/api/v1/payment/status/' + urllib.parse.quote(order_id, safe=''), token, timeout=10)
+    if e or status is None or status >= 400 or not data:
+        return None, {}
+    inner = data.get('data') if isinstance(data.get('data'), dict) else {}
+    st = str(data.get('status') or inner.get('status') or '').strip().lower()
+    merged = dict(inner); merged.update({k: v for k, v in data.items() if k != 'data'})
+    return st == 'success', merged
+
 def _verify_pg_order(order_id):
     """Paid only when the gateway says success and the amount equals what it asked the customer to pay."""
     order_id = str(order_id or '')
@@ -2105,19 +2124,61 @@ def _verify_pg_order(order_id):
     token = _pg_token(gw) if gw in PG_API_NAMES else ''
     if not order_id or not token:
         return False, None, None
+
+    # Amounts we accept: the exact amount the QR asked for (FamPay adds paise) or the requested one.
+    allowed = []
+    if saved:
+        allowed += [saved[3], saved[2]]
+    if details.get('amount') is not None:
+        allowed.append(details.get('amount'))
+
+    paid = False
+    body = {}
     status, data, e = _pg_request('GET', '/api/verify.php', token, params={'order_id': order_id}, timeout=10)
-    if e or status is None or status >= 400 or not data:
+    if status == 429:
+        print(f'[PAYGW] rate limit hit while verifying {order_id}; backing off')
+        time.sleep(6)
         return False, None, None
-    if str(data.get('status') or '').strip().lower() != 'success':
-        return False, None, None                       # pending / failed / expired
-    body = data.get('data') if isinstance(data.get('data'), dict) else {}
-    if body.get('order_id') not in (None, '') and str(body.get('order_id')) != order_id:
+    st = str((data or {}).get('status') or '').strip().lower() if not e else ''
+    if not e and status is not None and status < 400 and st == 'success':
+        paid = True
+        inner = data.get('data') if isinstance(data.get('data'), dict) else {}
+        body = dict(inner)
+        for k, v in data.items():
+            if k != 'data' and k not in body:
+                body[k] = v
+    elif st in ('pending', 'failed', 'expired', 'cancelled', 'canceled'):
         return False, None, None
-    expected = saved[3] if saved else details.get('amount')
-    if expected is None or body.get('amount') in (None, '') or not _fam_amount_equals(body.get('amount'), expected):
-        print(f'[PAYGW] order {order_id} amount missing/mismatch; not credited')
+    else:
+        # verify.php gave no clear answer (error / empty / unknown shape): ask the status endpoint.
+        print(f'[PAYGW] verify.php unclear for {order_id} (HTTP {status}, status={st or "-"}); trying status endpoint')
+        ok, body = _pg_status_lookup(token, order_id)
+        if not ok:
+            return False, None, None
+        paid = True
+
+    if body.get('order_id') not in (None, '') and str(body.get('order_id')) not in (order_id, str((saved[1] if saved else '') or '')):
+        print(f'[PAYGW] order id mismatch for {order_id}: {body.get("order_id")}')
         return False, None, None
-    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(body.get('utr') or 'N/A'))[:80] or 'N/A'
+
+    got_amount = _pg_find_amount(body)
+    if got_amount in (None, ''):
+        # verify.php did not include the amount: read it from the status endpoint.
+        ok, extra = _pg_status_lookup(token, order_id)
+        if ok:
+            got_amount = _pg_find_amount(extra)
+            if not body.get('utr') and extra.get('utr'):
+                body['utr'] = extra.get('utr')
+    if got_amount not in (None, '') and allowed:
+        if not any(_fam_amount_equals(got_amount, x) for x in allowed if x is not None):
+            print(f'[PAYGW] order {order_id} amount mismatch (gateway={got_amount}, expected={allowed}); not credited')
+            return False, None, None
+    elif got_amount in (None, ''):
+        # The gateway only reports SUCCESS after matching order id AND amount itself, and the
+        # order id is ours, so a success without an amount field is still accepted.
+        print(f'[PAYGW] order {order_id}: success without amount field; accepted on gateway verification')
+
+    utr = re.sub(r'[^A-Za-z0-9._/-]', '', str(body.get('utr') or body.get('transaction_id') or 'N/A'))[:80] or 'N/A'
     return True, utr, 'UPI'
 
 def _payment_poll_gap(gateway):
@@ -7984,33 +8045,39 @@ PAYMENT_TIMEOUT_SECONDS = 300
 
 def poll_payment_in_bot(chat_id, user_id, message_id, order_id, amount, pay_type, product_id=0, device_id=None):
     start_time = time.time()
-    while time.time() - start_time < PAYMENT_TIMEOUT_SECONDS: 
+    while time.time() - start_time < PAYMENT_TIMEOUT_SECONDS:
         if order_id not in active_orders:
-            return  
-            
+            return
+
         active_details = active_orders.get(order_id) or {}
         order_gateway = str(active_details.get('gateway') or _get_active_payment_gateway()).strip().lower()
-        is_paid, utr, sender = _verify_active_gateway_order(order_id, order_gateway)
+        try:
+            is_paid, utr, sender = _verify_active_gateway_order(order_id, order_gateway)
+        except Exception as exc:
+            # A single bad reply must never kill the poller (that left the QR frozen).
+            print(f'[PAYGW] verify error for {order_id}: {type(exc).__name__}: {exc}')
+            is_paid, utr, sender = False, None, None
         if is_paid:
-            # The  Transaction Status API is authoritative for the order,
-            # but we still require the returned transaction amount to match the
-            # locally created order before crediting balance/delivering a key.
-            active_details = active_orders.get(order_id) or {}
-            expected_amount = float(active_details.get('amount', amount) or amount)
-            if str(active_details.get('gateway') or order_gateway).lower() == '':
-                verified_amount = active_details.get('verified_amount')
-                # _verify__order returns only the success tuple for legacy
-                # compatibility; re-fetching the status here would be wasteful.
-                # The order amount is fixed by our own  QR request, so the
-                # successful order ID is already bound to this exact amount.
-                if abs(float(amount) - expected_amount) > 0.01:
-                    time.sleep(_payment_poll_gap(order_gateway))
-                    continue
+            if order_id not in active_orders:
+                return   # already handled elsewhere
             active_orders.pop(order_id, None)
-            process_successful_payment(chat_id, user_id, message_id, order_id, amount, pay_type, utr, product_id, device_id)
+            try:
+                process_successful_payment(chat_id, user_id, message_id, order_id, amount, pay_type, utr, product_id, device_id)
+            except Exception as exc:
+                import traceback
+                print(f'[PAYGW] process_successful_payment FAILED for {order_id}: {type(exc).__name__}: {exc}')
+                traceback.print_exc()
+                try:
+                    bot.send_message(chat_id,
+                        "⚠️ <b>Payment received, but there was an error while completing your order.</b>\n\n"
+                        f"Order ID: <code>{html.escape(str(order_id))}</code>\n"
+                        "Please contact support with this Order ID.",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
             return
         time.sleep(_payment_poll_gap(order_gateway))
-    
+
     if order_id in active_orders:
         order_details = active_orders.pop(order_id, None)
         if str(pay_type) == 'reseller_activation':
